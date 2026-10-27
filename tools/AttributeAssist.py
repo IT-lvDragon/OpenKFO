@@ -437,12 +437,55 @@ def find_main_window(pid):
 
 
 def send_move_key(hwnd, vk, down):
-    """向游戏窗口发送按键消息；返回是否已投递。"""
-    if not hwnd:
-        return False
+    """SendInput 注入真实键盘事件（系统级输入，DirectInput 游戏也能识别）。
+    仅当游戏窗口为前台时由 move_tick 调用；hwnd 供前台比对。"""
     lib = user32()
-    msg = WM_KEYDOWN if down else WM_KEYUP
-    return bool(lib.PostMessageW(hwnd, msg, vk, 0xC0000001 if not down else 1))
+    lib.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    lib.SendInput.restype = wintypes.UINT
+    lib.GetForegroundWindow.restype = wintypes.HWND
+    inp = INPUT(type=1)  # INPUT_KEYBOARD
+    inp.union.ki.wVk = vk
+    inp.union.ki.dwFlags = kb_flags(vk, down)
+    return lib.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
+
+
+def game_foreground(hwnd):
+    """游戏窗口是否处于前台；跑图按键只在投递给前台。"""
+    lib = user32()
+    lib.GetForegroundWindow.restype = wintypes.HWND
+    return bool(hwnd) and lib.GetForegroundWindow() == hwnd
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD)]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("union", _INPUTUNION)]
+
+
+def kb_flags(vk, down):
+    """SendInput 键盘标志：普通键按下 0 / 抬起 2；方向键为扩展键需 8 位。"""
+    ext = 8 if vk in (0x25, 0x26, 0x27, 0x28) else 0
+    return (ext | 2) if not down else ext
 
 
 def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
@@ -863,6 +906,10 @@ def self_test():
         and MOVE_KEYS["下(S)"] == 0x53 and MOVE_KEYS["右(→)"] == 0x27 \
         and MOVE_KEYS["左(←)"] == 0x25 and MOVE_KEYS["上(↑)"] == 0x26 \
         and MOVE_KEYS["下(↓)"] == 0x28
+
+    # SendInput 键盘标志：方向键为扩展键（8），普通键抬起置 2
+    ok = ok and kb_flags(0x44, True) == 0 and kb_flags(0x44, False) == 2
+    ok = ok and kb_flags(0x27, True) == 8 and kb_flags(0x27, False) == 10
 
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
@@ -1299,13 +1346,13 @@ def run_ui():
             self.save_settings()
 
         def move_tick(self):
-            """自动跑图状态机：检测到角色才按键；取消/失联/换局立即松键。"""
+            """自动跑图状态机：检测到角色、游戏前台才按键；取消/失联/换局立即松键。"""
             want = self.move_var.get() and self.handle and bool(self.actor)
             now = now_ms()
+            vk = MOVE_KEYS.get(self.move_key.get(), 0x44)
             if not want:
                 if self.move_pressed:
-                    send_move_key(self.move_hwnd,
-                                  MOVE_KEYS.get(self.move_key.get(), 0x44), False)
+                    send_move_key(self.move_hwnd, vk, False)
                     self.move_pressed = False
                     self.move_phase_at = 0
                 return
@@ -1314,9 +1361,16 @@ def run_ui():
                 if not self.move_hwnd:
                     self.move_status.set("未找到游戏窗口，无法发送按键。")
                     return
+            if not game_foreground(self.move_hwnd):
+                # SendInput 作用于前台窗口：游戏不在前台时不投递，避免按键打进别的程序
+                if self.move_pressed:
+                    send_move_key(self.move_hwnd, vk, False)
+                    self.move_pressed = False
+                    self.move_phase_at = now_ms()
+                self.move_status.set("游戏窗口不在前台，跑图已暂停；切回游戏窗口即自动恢复。")
+                return
             hold = parse_delay_ms(self.move_hold.get())
             release = parse_delay_ms(self.move_release.get(), 500)
-            vk = MOVE_KEYS.get(self.move_key.get(), 0x44)
             if self.move_pressed:
                 if hold and now - self.move_phase_at >= hold:
                     send_move_key(self.move_hwnd, vk, False)
