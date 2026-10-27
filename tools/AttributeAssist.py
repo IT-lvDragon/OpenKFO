@@ -72,6 +72,10 @@ k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wint
                                            ctypes.POINTER(wintypes.DWORD)]
 k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+k32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+k32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
 k32.VirtualAlloc.restype = ctypes.c_void_p
 k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
 k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
@@ -224,8 +228,7 @@ def format_value(bits, is_int):
 # ---- 进程枚举 ----
 def find_processes():
     out = []
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    snap = snap.value if snap else 0
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) or 0
     if not snap or snap == INVALID_HANDLE:
         return out
     try:
@@ -244,8 +247,7 @@ def find_processes():
 
 
 def module_base(pid):
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)
-    snap = snap.value if snap else 0
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) or 0
     if not snap or snap == INVALID_HANDLE:
         return 0
     entry = MODULEENTRY32W()
@@ -461,8 +463,7 @@ def run_ui():
             if not pid:
                 self.status.set("列表自动刷新；请先打开游戏并选择进程。")
                 return
-            handle = k32.OpenProcess(PROCESS_RIGHTS, False, pid)
-            handle = handle.value if handle else 0
+            handle = k32.OpenProcess(PROCESS_RIGHTS, False, pid) or 0
             if not handle:
                 error = ctypes.get_last_error()
                 if error == 5:
