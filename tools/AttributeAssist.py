@@ -48,7 +48,9 @@ FEATURES = [
     dict(name="吸血值（原版输入单位）", offset=0x6C, use_state=True, is_int=False, initial="10", scale=0.1),
 ]
 
-PROCESS_RIGHTS = 0x0400 | 0x0008 | 0x0010 | 0x0020 | 0x00100000
+# 与 main.cpp 的 OpenProcess 一致：缺 PROCESS_CREATE_THREAD(0x0002) 时
+# CreateRemoteThread 恒返回 ACCESS_DENIED，秒杀/中毒的远程线程永远创建失败。
+PROCESS_RIGHTS = 0x0400 | 0x0008 | 0x0010 | 0x0020 | 0x0002 | 0x00100000
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x102
 TH32CS_SNAPPROCESS = 0x2
@@ -506,6 +508,7 @@ class KillJob:
         self.thread = 0
         self.block = 0
         self.started = 0.0
+        self.start_error = 0
 
     def busy(self):
         return bool(self.thread)
@@ -535,9 +538,11 @@ class KillJob:
         if ok:
             thread = k32.CreateRemoteThread(process, None, 0, block, None, 0, None) or 0
         if not thread:
+            self.start_error = ctypes.get_last_error()
             k32.VirtualFreeEx(process, block, 0, MEM_RELEASE)
             return False
         self.thread, self.block, self.started = thread, block, time.monotonic()
+        self.start_error = 0
         return True
 
     def poll(self, process):
@@ -1264,7 +1269,13 @@ def run_ui():
             self.kill_queue.clear()
             self.kill_next = 0
             if self.auto_fault:
-                self.kill_status.set("自动操作因调用失败/异常暂停。勾选已保留；检查后重新连接恢复。")
+                err = self.kill_job.start_error
+                if err:
+                    self.kill_status.set(
+                        f"自动操作暂停：远程线程创建失败（Win32 错误码 {err}）。"
+                        "勾选已保留；处理后重新连接恢复。")
+                else:
+                    self.kill_status.set("自动操作因调用失败/异常暂停。勾选已保留；检查后重新连接恢复。")
                 return
             self.kill_status.set(
                 round_summary(self.kill_done, self.kill_skipped,
