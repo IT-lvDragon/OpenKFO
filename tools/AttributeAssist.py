@@ -854,33 +854,33 @@ def run_ui():
             killbox.pack(fill="x", padx=12, pady=(0, 4))
             self.kill_var = tk.BooleanVar(value=False)
             self.kill_armed_at = 0
+            self.kill_delay = tk.StringVar(value="0")
+            self.suicide_var = tk.BooleanVar(value=False)
+            self.suicide_armed_at = 0
+            self.suicide_delay = tk.StringVar(value="10")
             ttk.Checkbutton(killbox, text="自动秒杀敌方（9999 伤害，每 400ms 一轮）",
                             variable=self.kill_var,
                             command=self.save_settings).grid(row=0, column=0, sticky="w",
                                                              padx=8, pady=4)
-            self.suicide_var = tk.BooleanVar(value=False)
-            self.suicide_armed_at = 0
-            ttk.Checkbutton(killbox, text="自杀（对自己的角色打 9999 伤害，死后自动停）",
-                            variable=self.suicide_var,
-                            command=self.on_suicide_toggle).grid(row=0, column=1, sticky="w",
-                                                                 padx=8, pady=4)
-            ttk.Label(killbox, text="自杀延迟(秒)：").grid(row=0, column=2, sticky="e",
-                                                          padx=(12, 2), pady=4)
-            self.suicide_delay = tk.StringVar(value="10")
-            ttk.Spinbox(killbox, from_=0, to=3600, width=6,
-                        textvariable=self.suicide_delay,
-                        command=self.save_settings).grid(row=0, column=3, sticky="w",
-                                                         pady=4)
-            ttk.Label(killbox, text="秒杀延迟(秒)：").grid(row=1, column=0, sticky="e",
-                                                          padx=8, pady=4)
-            self.kill_delay = tk.StringVar(value="0")
+            ttk.Label(killbox, text="秒杀延迟(秒)：").grid(row=0, column=1, sticky="e",
+                                                          pady=4)
             ttk.Spinbox(killbox, from_=0, to=3600, width=6,
                         textvariable=self.kill_delay,
-                        command=self.save_settings).grid(row=1, column=1, sticky="w",
+                        command=self.save_settings).grid(row=0, column=2, sticky="w",
+                                                         pady=4)
+            ttk.Checkbutton(killbox, text="自杀（对自己的角色打 9999 伤害，死后自动停）",
+                            variable=self.suicide_var,
+                            command=self.on_suicide_toggle).grid(row=1, column=0, sticky="w",
+                                                                 padx=8, pady=4)
+            ttk.Label(killbox, text="自杀延迟(秒)：").grid(row=1, column=1, sticky="e",
+                                                          pady=4)
+            ttk.Spinbox(killbox, from_=0, to=3600, width=6,
+                        textvariable=self.suicide_delay,
+                        command=self.save_settings).grid(row=1, column=2, sticky="w",
                                                          pady=4)
             self.kill_status = tk.StringVar(value="进入有敌方角色的战斗后自动执行。")
             ttk.Label(killbox, textvariable=self.kill_status, wraplength=520,
-                      justify="left").grid(row=2, column=0, columnspan=4, sticky="w",
+                      justify="left").grid(row=2, column=0, columnspan=3, sticky="w",
                                            padx=8, pady=(0, 6))
 
             self.status = tk.StringVar(
