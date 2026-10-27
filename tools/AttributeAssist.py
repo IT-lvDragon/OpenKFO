@@ -72,10 +72,6 @@ k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wint
                                            ctypes.POINTER(wintypes.DWORD)]
 k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-k32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
-k32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
 k32.VirtualAlloc.restype = ctypes.c_void_p
 k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
 k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
@@ -97,6 +93,12 @@ class MODULEENTRY32W(ctypes.Structure):
                 ("ProccntUsage", wintypes.DWORD), ("modBaseAddr", ctypes.c_void_p),
                 ("modBaseSize", wintypes.DWORD), ("hModule", ctypes.c_void_p),
                 ("szModule", ctypes.c_wchar * 256), ("szExePath", ctypes.c_wchar * 260)]
+
+
+k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+k32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+k32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
 
 
 # ---- 内存读写 ----
