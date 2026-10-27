@@ -36,11 +36,15 @@ INFO_PTR = 0x13C86FC      # base+0x13C86FC -> 自己的信息（+0x18 为 uid）
 UID_OFFSET = 0xC90        # actor+0xC90  -> uid（uint64）
 STATE_OFFSET = 0x1A6C     # actor+0x1A6C -> state 指针
 
-# 功能表：use_state=True 时偏移基于 state 指针，否则基于 actor 指针。
-# is_int=True 为开关型（固定写 1）；否则按 0–999 浮点写入。
+# 功能表：use_state=True 时偏移基于 state 指针，否则基于 actor 指针（与 main.cpp address() 一致）。
+# is_int=True 为开关型（固定写 1）；否则按 0–999 浮点写入，实际值 = 输入 × scale。
 FEATURES = [
     dict(name="怒气倍率（999≈无限怒气）", offset=0x80, use_state=True, is_int=False, initial="999", scale=1.0),
-    dict(name="无敌", offset=0x1780, use_state=True, is_int=True, initial="1"),
+    dict(name="无敌", offset=0x1780, use_state=False, is_int=True, initial="1"),
+    dict(name="霸体", offset=0x64, use_state=True, is_int=True, initial="1"),
+    dict(name="反伤值", offset=0x1BD0, use_state=False, is_int=False, initial="1", scale=1.0),
+    dict(name="防御值", offset=0x78, use_state=True, is_int=False, initial="1", scale=1.0),
+    dict(name="吸血值（原版输入单位）", offset=0x6C, use_state=True, is_int=False, initial="10", scale=0.1),
 ]
 
 PROCESS_RIGHTS = 0x0400 | 0x0008 | 0x0010 | 0x0020 | 0x00100000
@@ -367,6 +371,13 @@ def self_test():
     ok = ok and not feature_desired("1000", rage)[1]
     inv = Feature(FEATURES[1])
     ok = ok and feature_desired("任意", inv) == (1, True)
+
+    # 基址映射必须与 main.cpp address() 完全一致（state 还是 actor 指针）
+    bases = [feature_address((actor, state, uid), Feature(spec)) for spec in FEATURES]
+    ok = ok and bases == [state + 0x80, actor + 0x1780, state + 0x64,
+                          actor + 0x1BD0, state + 0x78, state + 0x6C]
+    lifesteal = Feature(FEATURES[5])
+    ok = ok and feature_desired("10", lifesteal) == (0x3F800000, True)  # 10 × 0.1 = 1.0f
 
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
