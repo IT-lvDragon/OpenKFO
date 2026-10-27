@@ -392,6 +392,59 @@ def arm_delay(actor_ready, active, armed):
     return armed
 
 
+# ---- 自动跑图（键盘模拟：PostMessage 后台按键，不写内存）----
+MOVE_KEYS = {"右(D)": 0x44, "左(A)": 0x41, "上(W)": 0x57, "下(S)": 0x53,
+             "右(→)": 0x27, "左(←)": 0x25, "上(↑)": 0x26, "下(↓)": 0x28}
+WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+_u32 = None
+
+
+def user32():
+    """user32 惰性绑定（仅 Windows 实际调用；自检与 Linux 脚手架不触发）。"""
+    global _u32
+    if _u32 is None:
+        _u32 = ctypes.WinDLL("user32.dll", use_last_error=True)
+        _u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+        _u32.IsWindow.argtypes = [wintypes.HWND]
+        _u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        _u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                  ctypes.POINTER(wintypes.DWORD)]
+        _u32.EnumWindows.argtypes = [
+            ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+            wintypes.LPARAM]
+    return _u32
+
+
+def find_main_window(pid):
+    """取该进程第一个可见顶层窗口，作为跑图按键目标。"""
+    if not pid:
+        return 0
+    lib = user32()
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _lp):
+        owner = wintypes.DWORD()
+        lib.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and lib.IsWindowVisible(hwnd):
+            found.append(hwnd)
+            return False
+        return True
+
+    lib.EnumWindows(cb, 0)
+    return found[0] if found else 0
+
+
+def send_move_key(hwnd, vk, down):
+    """向游戏窗口发送按键消息；返回是否已投递。"""
+    if not hwnd:
+        return False
+    lib = user32()
+    msg = WM_KEYDOWN if down else WM_KEYUP
+    return bool(lib.PostMessageW(hwnd, msg, vk, 0xC0000001 if not down else 1))
+
+
 def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
     """移植 makeKill：全部前置检查通过后生成调用参数；失败返回 None。
     own/enemy 为 (ptr, state, uid)；reasons 收集拒绝原因，供状态行诊断显示。
@@ -804,6 +857,13 @@ def self_test():
     ok = ok and arm_delay(False, True, 123) == 0
     ok = ok and arm_delay(False, False, 0) == 0
 
+    # 自动跑图：方向键映射完整（WASD + 方向键两套）
+    ok = ok and len(MOVE_KEYS) == 8 and MOVE_KEYS["右(D)"] == 0x44 \
+        and MOVE_KEYS["左(A)"] == 0x41 and MOVE_KEYS["上(W)"] == 0x57 \
+        and MOVE_KEYS["下(S)"] == 0x53 and MOVE_KEYS["右(→)"] == 0x27 \
+        and MOVE_KEYS["左(←)"] == 0x25 and MOVE_KEYS["上(↑)"] == 0x26 \
+        and MOVE_KEYS["下(↓)"] == 0x28
+
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 2
@@ -905,6 +965,38 @@ def run_ui():
                       justify="left").grid(row=2, column=0, columnspan=3, sticky="w",
                                            padx=8, pady=(0, 6))
 
+            movebox = ttk.LabelFrame(root, text="自动跑图（后台按键模拟，不写内存）")
+            movebox.pack(fill="x", padx=12, pady=(0, 4))
+            self.move_var = tk.BooleanVar(value=False)
+            self.move_key = tk.StringVar(value="右(D)")
+            self.move_hold = tk.StringVar(value="2")
+            self.move_release = tk.StringVar(value="0.5")
+            self.move_pressed = False
+            self.move_phase_at = 0
+            self.move_hwnd = 0
+            self.pid = 0
+            ttk.Checkbutton(movebox, text="自动跑图（检测到角色后移动）",
+                            variable=self.move_var,
+                            command=self.on_move_toggle).grid(row=0, column=0,
+                                                              sticky="w", padx=8,
+                                                              pady=4)
+            ttk.Label(movebox, text="方向：").grid(row=0, column=1, sticky="e", pady=4)
+            ttk.OptionMenu(movebox, self.move_key, self.move_key.get(),
+                           *MOVE_KEYS).grid(row=0, column=2, sticky="w", pady=4)
+            ttk.Label(movebox, text="按住(秒)：").grid(row=0, column=3, sticky="e",
+                                                       pady=4)
+            ttk.Entry(movebox, textvariable=self.move_hold, width=6).grid(
+                row=0, column=4, sticky="w", pady=4)
+            ttk.Label(movebox, text="松开(秒)：").grid(row=0, column=5, sticky="e",
+                                                       pady=4)
+            ttk.Entry(movebox, textvariable=self.move_release, width=6).grid(
+                row=0, column=6, sticky="w", pady=4)
+            self.move_status = tk.StringVar(
+                value="按住 0 = 一直按住不松；松开 0 = 到点立刻再按。取消勾选立即松键。")
+            ttk.Label(movebox, textvariable=self.move_status, wraplength=520,
+                      justify="left").grid(row=1, column=0, columnspan=7, sticky="w",
+                                           padx=8, pady=(0, 6))
+
             self.status = tk.StringVar(
                 value="游戏运行后选择进程点击“启动”；换局自动继续，取消勾选会恢复原值。")
             ttk.Label(root, textvariable=self.status, wraplength=520,
@@ -943,6 +1035,10 @@ def run_ui():
             self.suicide_var.set(bool(data.get("suicide", False)))
             self.suicide_delay.set(str(data.get("suicide_delay", "10")))
             self.suicide_armed_at = 0  # 等 actor 检测到后再武装
+            self.move_var.set(bool(data.get("move", False)))
+            self.move_key.set(str(data.get("move_key", "右(D)")))
+            self.move_hold.set(str(data.get("move_hold", "2")))
+            self.move_release.set(str(data.get("move_release", "0.5")))
 
         def save_settings(self):
             path = settings_path()
@@ -954,7 +1050,11 @@ def run_ui():
                     "kill": self.kill_var.get(),
                     "kill_delay": self.kill_delay.get(),
                     "suicide": self.suicide_var.get(),
-                    "suicide_delay": self.suicide_delay.get()}
+                    "suicide_delay": self.suicide_delay.get(),
+                    "move": self.move_var.get(),
+                    "move_key": self.move_key.get(),
+                    "move_hold": self.move_hold.get(),
+                    "move_release": self.move_release.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -1018,6 +1118,7 @@ def run_ui():
                 note = "（未核对版本：属性可能无效甚至闪退；秒杀受序言检查保护会自动拒绝）"
             base = module_base(pid) or BASE_FALLBACK
             self.handle, self.base, self.actor = handle, base, None
+            self.pid = pid
             self.auto_fault = False
             self.status.set(f"已启动{note}。沿用勾选设置，换局自动继续，无需重复连接。")
 
@@ -1188,6 +1289,44 @@ def run_ui():
             self.suicide_armed_at = 0
             self.save_settings()
 
+        def on_move_toggle(self):
+            # 取消勾选立即松键（move_tick 也会兜底松键，这里保证即时响应）
+            if not self.move_var.get() and self.move_pressed:
+                send_move_key(self.move_hwnd,
+                              MOVE_KEYS.get(self.move_key.get(), 0x44), False)
+                self.move_pressed = False
+                self.move_phase_at = 0
+            self.save_settings()
+
+        def move_tick(self):
+            """自动跑图状态机：检测到角色才按键；取消/失联/换局立即松键。"""
+            want = self.move_var.get() and self.handle and bool(self.actor)
+            now = now_ms()
+            if not want:
+                if self.move_pressed:
+                    send_move_key(self.move_hwnd,
+                                  MOVE_KEYS.get(self.move_key.get(), 0x44), False)
+                    self.move_pressed = False
+                    self.move_phase_at = 0
+                return
+            if not self.move_hwnd or not user32().IsWindow(self.move_hwnd):
+                self.move_hwnd = find_main_window(self.pid)
+                if not self.move_hwnd:
+                    self.move_status.set("未找到游戏窗口，无法发送按键。")
+                    return
+            hold = parse_delay_ms(self.move_hold.get())
+            release = parse_delay_ms(self.move_release.get(), 500)
+            vk = MOVE_KEYS.get(self.move_key.get(), 0x44)
+            if self.move_pressed:
+                if hold and now - self.move_phase_at >= hold:
+                    send_move_key(self.move_hwnd, vk, False)
+                    self.move_pressed = False
+                    self.move_phase_at = now
+            elif not release or now - self.move_phase_at >= release:
+                send_move_key(self.move_hwnd, vk, True)
+                self.move_pressed = True
+                self.move_phase_at = now
+
         def start_kill(self):
             if self.kill_busy() or self.auto_fault:
                 return
@@ -1264,9 +1403,14 @@ def run_ui():
             # 秒杀独立 30ms 循环（C++ 版为 20ms 定时器），不随属性 tick 变慢
             if self.handle:
                 self.auto_tick()
+            self.move_tick()
             self.root.after(30, self.auto_loop)
 
         def on_close(self):
+            if self.move_pressed:
+                send_move_key(self.move_hwnd,
+                              MOVE_KEYS.get(self.move_key.get(), 0x44), False)
+                self.move_pressed = False
             self.save_settings()
             if self.handle and not self.stop(silent=True):
                 self.status.set("恢复原值失败，请保持游戏运行后再关闭本窗口重试。")
