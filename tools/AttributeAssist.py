@@ -370,6 +370,15 @@ def round_due(now, previous, busy, paused, wanted):
     return (not busy) and (not paused) and wanted and now - previous >= 400
 
 
+def parse_delay_ms(text, default=10000):
+    """自杀延迟输入解析：秒 → 毫秒；非法回退默认，负数归零，上限 1 小时。"""
+    try:
+        value = int(float(str(text).strip()))
+    except (ValueError, AttributeError, TypeError):
+        return default
+    return max(0, min(value * 1000, 3600 * 1000))
+
+
 def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
     """移植 makeKill：全部前置检查通过后生成调用参数；失败返回 None。
     own/enemy 为 (ptr, state, uid)；reasons 收集拒绝原因，供状态行诊断显示。
@@ -769,6 +778,11 @@ def self_test():
     ok = ok and not round_due(1800, 1000, False, True, True)
     ok = ok and not round_due(1800, 1000, False, False, False)
 
+    # 自杀延迟解析：秒→毫秒、非法回退、负数归零、上限 1 小时
+    ok = ok and parse_delay_ms("5") == 5000 and parse_delay_ms("0") == 0
+    ok = ok and parse_delay_ms("abc") == 10000 and parse_delay_ms("") == 10000
+    ok = ok and parse_delay_ms("-3") == 0 and parse_delay_ms("9999") == 3600000
+
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 2
@@ -844,10 +858,18 @@ def run_ui():
                             command=self.save_settings).grid(row=0, column=0, sticky="w",
                                                              padx=8, pady=4)
             self.suicide_var = tk.BooleanVar(value=False)
+            self.suicide_armed_at = 0
             ttk.Checkbutton(killbox, text="自杀（对自己的角色打 9999 伤害，死后自动停）",
                             variable=self.suicide_var,
-                            command=self.save_settings).grid(row=0, column=1, sticky="w",
-                                                             padx=8, pady=4)
+                            command=self.on_suicide_toggle).grid(row=0, column=1, sticky="w",
+                                                                 padx=8, pady=4)
+            ttk.Label(killbox, text="自杀延迟(秒)：").grid(row=0, column=2, sticky="e",
+                                                          padx=(12, 2), pady=4)
+            self.suicide_delay = tk.StringVar(value="10")
+            ttk.Spinbox(killbox, from_=0, to=3600, width=6,
+                        textvariable=self.suicide_delay,
+                        command=self.save_settings).grid(row=0, column=3, sticky="w",
+                                                         pady=4)
             self.kill_status = tk.StringVar(value="进入有敌方角色的战斗后自动执行。")
             ttk.Label(killbox, textvariable=self.kill_status, wraplength=520,
                       justify="left").grid(row=1, column=0, columnspan=2, sticky="w",
@@ -887,6 +909,8 @@ def run_ui():
                 entry.configure(state=state)
             self.kill_var.set(bool(data.get("kill", False)))
             self.suicide_var.set(bool(data.get("suicide", False)))
+            self.suicide_delay.set(str(data.get("suicide_delay", "10")))
+            self.suicide_armed_at = now_ms() if self.suicide_var.get() else 0
 
         def save_settings(self):
             path = settings_path()
@@ -896,7 +920,8 @@ def run_ui():
                                   "value": self.rows[i][1].get()}
                                  for i in range(len(self.features))],
                     "kill": self.kill_var.get(),
-                    "suicide": self.suicide_var.get()}
+                    "suicide": self.suicide_var.get(),
+                    "suicide_delay": self.suicide_delay.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -1120,6 +1145,11 @@ def run_ui():
                 round_summary(self.kill_done, self.kill_skipped,
                               self.round_reasons, self.kill_cancel))
 
+        def on_suicide_toggle(self):
+            # 勾选即起算延迟；到点由 auto_tick 的轮询执行，期间取消勾选即作废
+            self.suicide_armed_at = now_ms() if self.suicide_var.get() else 0
+            self.save_settings()
+
         def start_kill(self):
             if self.kill_busy() or self.auto_fault:
                 return
@@ -1137,6 +1167,14 @@ def run_ui():
             self.round_reasons = {}
             # 自杀优先：一次性调用，角色死亡后 0x7C 检查会自然拒绝，不会反复自残
             if self.suicide_var.get():
+                delay_ms = parse_delay_ms(self.suicide_delay.get())
+                elapsed = now_ms() - self.suicide_armed_at
+                if elapsed < delay_ms:
+                    remain = (delay_ms - elapsed + 999) // 1000
+                    self.kill_status.set(
+                        f"自杀将在 {remain} 秒后执行；期间可取消勾选作废。"
+                        + round_summary(0, 0, self.round_reasons, False))
+                    return
                 k = make_kill(self.handle, self.base, self.actor, self.actor,
                               self.round_reasons, suicide=True)
                 if k and self.kill_job.start(self.handle, k):
