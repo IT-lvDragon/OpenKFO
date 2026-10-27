@@ -910,7 +910,7 @@ def run_ui():
             self.kill_var.set(bool(data.get("kill", False)))
             self.suicide_var.set(bool(data.get("suicide", False)))
             self.suicide_delay.set(str(data.get("suicide_delay", "10")))
-            self.suicide_armed_at = now_ms() if self.suicide_var.get() else 0
+            self.suicide_armed_at = 0  # 等 actor 检测到后再武装
 
         def save_settings(self):
             path = settings_path()
@@ -1146,8 +1146,8 @@ def run_ui():
                               self.round_reasons, self.kill_cancel))
 
         def on_suicide_toggle(self):
-            # 勾选即起算延迟；到点由 auto_tick 的轮询执行，期间取消勾选即作废
-            self.suicide_armed_at = now_ms() if self.suicide_var.get() else 0
+            # 起算点不在这里：由 auto_tick 在检测到角色地址后武装计时，换局/取消即作废
+            self.suicide_armed_at = 0
             self.save_settings()
 
         def start_kill(self):
@@ -1185,6 +1185,8 @@ def run_ui():
                 if k:
                     self.kill_cancel = True
                     self.auto_fault = True
+                elif self.round_reasons.get("自身未激活"):
+                    self.suicide_armed_at = 0  # 角色已死：复活后重新计延迟
             for a in actors:
                 if self.kill_var.get():
                     k = make_kill(self.handle, self.base, self.actor, a,
@@ -1200,6 +1202,12 @@ def run_ui():
 
         def auto_tick(self):
             self.poll_kill()
+            # 自杀延迟起算点：检测到角色地址（进入战斗）才开始计时；角色消失重新武装
+            if self.suicide_var.get():
+                if self.actor and not self.suicide_armed_at:
+                    self.suicide_armed_at = now_ms()
+                elif not self.actor and self.suicide_armed_at:
+                    self.suicide_armed_at = 0
             wanted = self.kill_var.get() or self.suicide_var.get()
             if wanted and self.actor and \
                     round_due(now_ms(), self.last_round, self.kill_busy(),
