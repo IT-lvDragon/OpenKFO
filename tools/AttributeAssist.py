@@ -853,6 +853,7 @@ def run_ui():
             killbox = ttk.LabelFrame(root, text="自动战斗（游戏原生调用：SEH 守卫 + 轮次复查）")
             killbox.pack(fill="x", padx=12, pady=(0, 4))
             self.kill_var = tk.BooleanVar(value=False)
+            self.kill_armed_at = 0
             ttk.Checkbutton(killbox, text="自动秒杀敌方（9999 伤害，每 400ms 一轮）",
                             variable=self.kill_var,
                             command=self.save_settings).grid(row=0, column=0, sticky="w",
@@ -870,9 +871,16 @@ def run_ui():
                         textvariable=self.suicide_delay,
                         command=self.save_settings).grid(row=0, column=3, sticky="w",
                                                          pady=4)
+            ttk.Label(killbox, text="秒杀延迟(秒)：").grid(row=1, column=0, sticky="e",
+                                                          padx=8, pady=4)
+            self.kill_delay = tk.StringVar(value="0")
+            ttk.Spinbox(killbox, from_=0, to=3600, width=6,
+                        textvariable=self.kill_delay,
+                        command=self.save_settings).grid(row=1, column=1, sticky="w",
+                                                         pady=4)
             self.kill_status = tk.StringVar(value="进入有敌方角色的战斗后自动执行。")
             ttk.Label(killbox, textvariable=self.kill_status, wraplength=520,
-                      justify="left").grid(row=1, column=0, columnspan=2, sticky="w",
+                      justify="left").grid(row=2, column=0, columnspan=4, sticky="w",
                                            padx=8, pady=(0, 6))
 
             self.status = tk.StringVar(
@@ -908,6 +916,8 @@ def run_ui():
                 entry.insert(0, str(item.get("value", f.initial)))
                 entry.configure(state=state)
             self.kill_var.set(bool(data.get("kill", False)))
+            self.kill_delay.set(str(data.get("kill_delay", "0")))
+            self.kill_armed_at = 0  # 等 actor 检测到后再武装
             self.suicide_var.set(bool(data.get("suicide", False)))
             self.suicide_delay.set(str(data.get("suicide_delay", "10")))
             self.suicide_armed_at = 0  # 等 actor 检测到后再武装
@@ -920,6 +930,7 @@ def run_ui():
                                   "value": self.rows[i][1].get()}
                                  for i in range(len(self.features))],
                     "kill": self.kill_var.get(),
+                    "kill_delay": self.kill_delay.get(),
                     "suicide": self.suicide_var.get(),
                     "suicide_delay": self.suicide_delay.get()}
             try:
@@ -1150,6 +1161,14 @@ def run_ui():
             self.suicide_armed_at = 0
             self.save_settings()
 
+        def arm_delay(active, armed):
+            """延迟起算：检测到角色地址才武装计时；勾选取消或角色消失即作废。"""
+            if self.actor and active and not armed:
+                return now_ms()
+            if (not active or not self.actor) and armed:
+                return 0
+            return armed
+
         def start_kill(self):
             if self.kill_busy() or self.auto_fault:
                 return
@@ -1165,49 +1184,53 @@ def run_ui():
             self.kill_next = self.kill_done = self.kill_skipped = 0
             self.kill_cancel = False
             self.round_reasons = {}
-            # 自杀优先：一次性调用，角色死亡后 0x7C 检查会自然拒绝，不会反复自残
+            # 自杀：一次性调用，角色死亡后 0x7C 检查会自然拒绝，不会反复自残
+            # 延迟未到时跳过自杀但继续秒杀，两者互不阻塞
+            notes = ""
             if self.suicide_var.get():
                 delay_ms = parse_delay_ms(self.suicide_delay.get())
                 elapsed = now_ms() - self.suicide_armed_at
                 if elapsed < delay_ms:
-                    remain = (delay_ms - elapsed + 999) // 1000
-                    self.kill_status.set(
-                        f"自杀将在 {remain} 秒后执行；期间可取消勾选作废。"
-                        + round_summary(0, 0, self.round_reasons, False))
-                    return
-                k = make_kill(self.handle, self.base, self.actor, self.actor,
-                              self.round_reasons, suicide=True)
-                if k and self.kill_job.start(self.handle, k):
-                    self.current_target = self.actor
-                    self.kill_status.set("正在执行自杀调用；上一轮未结束时不重复创建任务。")
-                    return
-                self.kill_skipped += 1
-                if k:
-                    self.kill_cancel = True
-                    self.auto_fault = True
-                elif self.round_reasons.get("自身未激活"):
-                    self.suicide_armed_at = 0  # 角色已死：复活后重新计延迟
+                    notes += ("自杀将在 %d 秒后执行；"
+                              % ((delay_ms - elapsed + 999) // 1000))
+                else:
+                    k = make_kill(self.handle, self.base, self.actor, self.actor,
+                                  self.round_reasons, suicide=True)
+                    if k and self.kill_job.start(self.handle, k):
+                        self.current_target = self.actor
+                        self.kill_status.set("正在执行自杀调用；上一轮未结束时不重复创建任务。")
+                        return
+                    self.kill_skipped += 1
+                    if k:
+                        self.kill_cancel = True
+                        self.auto_fault = True
+                    elif self.round_reasons.get("自身未激活"):
+                        self.suicide_armed_at = 0  # 角色已死：复活后重新计延迟
+            kill_hold = ""
+            if self.kill_var.get():
+                delay_ms = parse_delay_ms(self.kill_delay.get())
+                elapsed = now_ms() - self.kill_armed_at
+                if elapsed < delay_ms:
+                    kill_hold = ("秒杀将在 %d 秒后开始；"
+                                 % ((delay_ms - elapsed + 999) // 1000))
             for a in actors:
-                if self.kill_var.get():
+                if self.kill_var.get() and not kill_hold:
                     k = make_kill(self.handle, self.base, self.actor, a,
                                   self.round_reasons)
                     if k:
                         self.kill_queue.append(a)
             if not self.kill_queue:
-                self.kill_status.set("已勾选，等待可操作目标；" +
+                self.kill_status.set("已勾选，等待可操作目标；" + notes + kill_hold +
                                      round_summary(0, 0, self.round_reasons, False))
                 return
-            self.kill_status.set("正在执行；上一轮未结束时不重复创建任务。")
+            self.kill_status.set("正在执行；上一轮未结束时不重复创建任务。" + kill_hold)
             self.poll_kill()
 
         def auto_tick(self):
             self.poll_kill()
-            # 自杀延迟起算点：检测到角色地址（进入战斗）才开始计时；角色消失重新武装
-            if self.suicide_var.get():
-                if self.actor and not self.suicide_armed_at:
-                    self.suicide_armed_at = now_ms()
-                elif not self.actor and self.suicide_armed_at:
-                    self.suicide_armed_at = 0
+            # 自杀/秒杀延迟起算点：检测到角色地址（进入战斗）才开始计时；角色消失重新武装
+            self.suicide_armed_at = arm_delay(self.suicide_var.get(), self.suicide_armed_at)
+            self.kill_armed_at = arm_delay(self.kill_var.get(), self.kill_armed_at)
             wanted = self.kill_var.get() or self.suicide_var.get()
             if wanted and self.actor and \
                     round_due(now_ms(), self.last_round, self.kill_busy(),
