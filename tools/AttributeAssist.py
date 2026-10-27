@@ -371,10 +371,14 @@ def round_due(now, previous, busy, paused, wanted):
 
 
 def parse_delay_ms(text, default=10000):
-    """自杀延迟输入解析：秒 → 毫秒；非法回退默认，负数归零，上限 1 小时。"""
+    """自杀/秒杀延迟输入解析：秒 → 毫秒。
+    空输入与 0 视为立即执行；非法回退默认；负数归零；上限 1 小时。"""
+    text = str(text).strip()
+    if not text:
+        return 0
     try:
-        value = int(float(str(text).strip()))
-    except (ValueError, AttributeError, TypeError):
+        value = int(float(text))
+    except ValueError:
         return default
     return max(0, min(value * 1000, 3600 * 1000))
 
@@ -778,9 +782,10 @@ def self_test():
     ok = ok and not round_due(1800, 1000, False, True, True)
     ok = ok and not round_due(1800, 1000, False, False, False)
 
-    # 自杀延迟解析：秒→毫秒、非法回退、负数归零、上限 1 小时
+    # 自杀延迟解析：秒→毫秒、空/0=立即执行、非法回退、负数归零、上限 1 小时
     ok = ok and parse_delay_ms("5") == 5000 and parse_delay_ms("0") == 0
-    ok = ok and parse_delay_ms("abc") == 10000 and parse_delay_ms("") == 10000
+    ok = ok and parse_delay_ms("") == 0 and parse_delay_ms("  ") == 0
+    ok = ok and parse_delay_ms("abc") == 10000
     ok = ok and parse_delay_ms("-3") == 0 and parse_delay_ms("9999") == 3600000
 
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
