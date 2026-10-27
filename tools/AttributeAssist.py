@@ -84,7 +84,7 @@ class PROCESSENTRY32W(ctypes.Structure):
                 ("th32ProcessID", wintypes.DWORD),
                 ("th32DefaultHeapID", ctypes.c_size_t),
                 ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_ssize_t),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
                 ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
 
 
@@ -251,7 +251,7 @@ def find_processes(want_all=False):
         entry.dwSize = ctypes.sizeof(entry)
         if not k32.Process32FirstW(snap, entry):
             LAST_SNAP_ERROR = (f"Process32FirstW 失败（错误码 {ctypes.get_last_error()}，"
-                               f"{sys.maxsize * 8 + 4} 位 Python，结构体大小 {entry.dwSize}）")
+                               f"{ctypes.sizeof(ctypes.c_void_p) * 8} 位 Python，结构体大小 {entry.dwSize}）")
             return out
         while True:
             name = entry.szExeFile
@@ -312,6 +312,12 @@ def file_sha256(path):
 
 # ---- 自检：无 GUI，校验定位/读写/恢复语义 ----
 def self_test():
+    # Toolhelp 结构体必须与 Windows 头文件布局完全一致，否则 Process32First 报错 24
+    assert ctypes.sizeof(PROCESSENTRY32W) == (568 if ctypes.sizeof(ctypes.c_void_p) == 8 else 556), \
+        f"PROCESSENTRY32W 尺寸异常: {ctypes.sizeof(PROCESSENTRY32W)}"
+    assert ctypes.sizeof(MODULEENTRY32W) == (1080 if ctypes.sizeof(ctypes.c_void_p) == 8 else 1064), \
+        f"MODULEENTRY32W 尺寸异常: {ctypes.sizeof(MODULEENTRY32W)}"
+
     buffer = k32.VirtualAlloc(None, 0x1400000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
     if not buffer:
         return 1
