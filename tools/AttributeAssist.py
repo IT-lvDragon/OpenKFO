@@ -365,15 +365,16 @@ def round_due(now, previous, busy, paused, wanted):
     return (not busy) and (not paused) and wanted and now - previous >= 400
 
 
-def make_kill(handle, base, own, enemy, reasons=None):
+def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
     """移植 makeKill：全部前置检查通过后生成调用参数；失败返回 None。
-    own/enemy 为 (ptr, state, uid)；reasons 收集拒绝原因，供状态行诊断显示。"""
+    own/enemy 为 (ptr, state, uid)；reasons 收集拒绝原因，供状态行诊断显示。
+    suicide=True 时目标即自己（target=source=own uid），跳过目标与队伍检查。"""
     def refuse(tag):
         if reasons is not None:
             reasons[tag] = reasons.get(tag, 0) + 1
         return None
 
-    if enemy[2] == own[2] or not enemy[1]:
+    if not suicide and (enemy[2] == own[2] or not enemy[1]):
         return refuse("目标无效")
     if read_u32(handle, own[0] + 0x7C) != 1:
         return refuse("自身未激活")
@@ -387,7 +388,7 @@ def make_kill(handle, base, own, enemy, reasons=None):
     enemy_team = read_u32(handle, enemy[0] + 0x28)
     if own_team is None or enemy_team is None:
         return refuse("内存读取失败")
-    if own_team == enemy_team:
+    if own_team == enemy_team and not suicide:
         return refuse("同队")
     manager = read_u32(handle, base + MANAGER_PTR)
     if not manager:
@@ -725,15 +726,26 @@ def self_test():
         ok = ok and struct.unpack_from("<Q", k["packet"], 86)[0] == 0x1234567800000007
         ok = ok and len(k["guards"]) == 13
 
+    # 自杀：target=source=自己，绕过目标/队伍检查，其余检查与守卫不变
+    reasons = {}
+    ok = ok and make_kill(handle, base, own_a, own_a, reasons) is None
+    ok = ok and reasons.get("目标无效") == 1
+    s = make_kill(handle, base, own_a, own_a, reasons, suicide=True)
+    ok = ok and bool(s)
+    if s:
+        ok = ok and struct.unpack_from("<Q", s["packet"], 39)[0] == uid
+        ok = ok and struct.unpack_from("<Q", s["packet"], 47)[0] == uid
+        ok = ok and s["bits"] == 0x461C3C00 and len(s["guards"]) == 13
+
     # 轮次状态行：拒绝原因分布
     ok = ok and round_summary(2, 3, {"同队": 2, "目标未激活": 1}, False) \
         == "本次结束：完成 2，跳过 3（同队×2，目标未激活×1）。"
     ok = ok and round_summary(0, 0, {}, True) == "已停止：完成 0，跳过 0。"
 
     # shellcode 结构完整性（语义已由 C++ killSelfTest 在真机上验证）
-    code = kill_code(0x10000000, 0x20000000, k or {"guards": [], "health": 0,
-                                                   "target": 0, "send": 0, "source": 0,
-                                                   "bits": 0, "damage": 0})
+    code = kill_code(0x10000000, 0x20000000, s or k or {"guards": [], "health": 0,
+                                                        "target": 0, "send": 0, "source": 0,
+                                                        "bits": 0, "damage": 0})
     tail = code.rfind(b"\xC2\x04\x00")
     ok = ok and len(code) <= 4096 and code[0] == 0x55 and code[1] == 0x8B and code[2] == 0xEC
     ok = ok and tail != -1 and struct.unpack_from("<I", code, 11)[0] == 0x10000000 + tail + 3
@@ -819,6 +831,11 @@ def run_ui():
                             variable=self.kill_var,
                             command=self.save_settings).grid(row=0, column=0, sticky="w",
                                                              padx=8, pady=4)
+            self.suicide_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(killbox, text="自杀（对自己的角色打 9999 伤害，死后自动停）",
+                            variable=self.suicide_var,
+                            command=self.save_settings).grid(row=0, column=1, sticky="w",
+                                                             padx=8, pady=4)
             self.kill_status = tk.StringVar(value="进入有敌方角色的战斗后自动执行。")
             ttk.Label(killbox, textvariable=self.kill_status, wraplength=520,
                       justify="left").grid(row=1, column=0, columnspan=2, sticky="w",
@@ -857,6 +874,7 @@ def run_ui():
                 entry.insert(0, str(item.get("value", f.initial)))
                 entry.configure(state=state)
             self.kill_var.set(bool(data.get("kill", False)))
+            self.suicide_var.set(bool(data.get("suicide", False)))
 
         def save_settings(self):
             path = settings_path()
@@ -865,7 +883,8 @@ def run_ui():
             data = {"features": [{"enabled": self.rows[i][0].get(),
                                   "value": self.rows[i][1].get()}
                                  for i in range(len(self.features))],
-                    "kill": self.kill_var.get()}
+                    "kill": self.kill_var.get(),
+                    "suicide": self.suicide_var.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -1093,17 +1112,29 @@ def run_ui():
             if self.kill_busy() or self.auto_fault:
                 return
             if not self.handle or not self.actor or not self.actor[1]:
-                self.kill_status.set("请先启动，并进入有敌方角色的战斗。")
+                self.kill_status.set("请先启动，并进入战斗。")
                 return
             manager = read_u32(self.handle, self.base + MANAGER_PTR)
             ok, actors = list_actors(self.handle, manager) if manager else (False, [])
             if not ok:
-                self.kill_status.set("请先启动，并进入有敌方角色的战斗。")
+                self.kill_status.set("请先启动，并进入战斗。")
                 return
             self.kill_queue.clear()
             self.kill_next = self.kill_done = self.kill_skipped = 0
             self.kill_cancel = False
             self.round_reasons = {}
+            # 自杀优先：一次性调用，角色死亡后 0x7C 检查会自然拒绝，不会反复自残
+            if self.suicide_var.get():
+                k = make_kill(self.handle, self.base, self.actor, self.actor,
+                              self.round_reasons, suicide=True)
+                if k and self.kill_job.start(self.handle, k):
+                    self.current_target = self.actor
+                    self.kill_status.set("正在执行自杀调用；上一轮未结束时不重复创建任务。")
+                    return
+                self.kill_skipped += 1
+                if k:
+                    self.kill_cancel = True
+                    self.auto_fault = True
             for a in actors:
                 if self.kill_var.get():
                     k = make_kill(self.handle, self.base, self.actor, a,
@@ -1119,7 +1150,7 @@ def run_ui():
 
         def auto_tick(self):
             self.poll_kill()
-            wanted = self.kill_var.get()
+            wanted = self.kill_var.get() or self.suicide_var.get()
             if wanted and self.actor and \
                     round_due(now_ms(), self.last_round, self.kill_busy(),
                               self.auto_fault or self.disconnect_pending, wanted):
