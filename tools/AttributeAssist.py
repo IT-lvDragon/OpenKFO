@@ -875,6 +875,7 @@ def run_ui():
             killbox.pack(fill="x", padx=12, pady=(0, 4))
             self.kill_var = tk.BooleanVar(value=False)
             self.kill_armed_at = 0
+            self.kill_last_fire = 0
             self.kill_delay = tk.StringVar(value="0")
             self.suicide_var = tk.BooleanVar(value=False)
             self.suicide_armed_at = 0
@@ -1155,11 +1156,16 @@ def run_ui():
                 if not k:
                     self.kill_skipped += 1
                     continue
+                interval = parse_delay_ms(self.kill_delay.get())
+                if interval and now_ms() - self.kill_last_fire < interval:
+                    self.kill_next -= 1  # 击杀间隔未到：目标退回队头，下轮再试
+                    return
                 if not self.kill_job.start(self.handle, k):
                     self.kill_cancel = True
                     self.auto_fault = True
                     self.kill_skipped += 1
                     break
+                self.kill_last_fire = now_ms()
                 self.current_target = actor
                 return
             self.kill_queue.clear()
