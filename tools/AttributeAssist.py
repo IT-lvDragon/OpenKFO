@@ -383,6 +383,15 @@ def parse_delay_ms(text, default=10000):
     return max(0, min(value * 1000, 3600 * 1000))
 
 
+def arm_delay(actor_ready, active, armed):
+    """延迟起算：检测到角色地址且勾选后才开始计时；取消勾选或角色消失即作废。"""
+    if actor_ready and active and not armed:
+        return now_ms()
+    if (not active or not actor_ready) and armed:
+        return 0
+    return armed
+
+
 def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
     """移植 makeKill：全部前置检查通过后生成调用参数；失败返回 None。
     own/enemy 为 (ptr, state, uid)；reasons 收集拒绝原因，供状态行诊断显示。
@@ -788,6 +797,13 @@ def self_test():
     ok = ok and parse_delay_ms("abc") == 10000
     ok = ok and parse_delay_ms("-3") == 0 and parse_delay_ms("9999") == 3600000
 
+    # 延迟武装：actor 就绪且勾选才起算；取消勾选或角色失联即作废
+    ok = ok and arm_delay(True, True, 0) > 0
+    ok = ok and arm_delay(True, True, 123) == 123
+    ok = ok and arm_delay(True, False, 123) == 0
+    ok = ok and arm_delay(False, True, 123) == 0
+    ok = ok and arm_delay(False, False, 0) == 0
+
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 2
@@ -1166,14 +1182,6 @@ def run_ui():
             self.suicide_armed_at = 0
             self.save_settings()
 
-        def arm_delay(active, armed):
-            """延迟起算：检测到角色地址才武装计时；勾选取消或角色消失即作废。"""
-            if self.actor and active and not armed:
-                return now_ms()
-            if (not active or not self.actor) and armed:
-                return 0
-            return armed
-
         def start_kill(self):
             if self.kill_busy() or self.auto_fault:
                 return
@@ -1234,10 +1242,11 @@ def run_ui():
         def auto_tick(self):
             self.poll_kill()
             # 自杀/秒杀延迟起算点：检测到角色地址（进入战斗）才开始计时；角色消失重新武装
-            self.suicide_armed_at = self.arm_delay(self.suicide_var.get(),
-                                                   self.suicide_armed_at)
-            self.kill_armed_at = self.arm_delay(self.kill_var.get(),
-                                                self.kill_armed_at)
+            ready = bool(self.actor)
+            self.suicide_armed_at = arm_delay(ready, self.suicide_var.get(),
+                                              self.suicide_armed_at)
+            self.kill_armed_at = arm_delay(ready, self.kill_var.get(),
+                                           self.kill_armed_at)
             wanted = self.kill_var.get() or self.suicide_var.get()
             if wanted and self.actor and \
                     round_due(now_ms(), self.last_round, self.kill_busy(),
