@@ -49,7 +49,7 @@ FEATURES = [
 ]
 
 # 与 main.cpp 的 OpenProcess 一致：缺 PROCESS_CREATE_THREAD(0x0002) 时
-# CreateRemoteThread 恒返回 ACCESS_DENIED，秒杀/中毒的远程线程永远创建失败。
+# CreateRemoteThread 恒返回 ACCESS_DENIED，秒杀的远程线程永远创建失败。
 PROCESS_RIGHTS = 0x0400 | 0x0008 | 0x0010 | 0x0020 | 0x0002 | 0x00100000
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x102
@@ -196,14 +196,10 @@ def resolve_actor(handle, manager, uid):
     return None
 
 
-# ---- 秒杀与中毒：移植自 tools/game-mod/kill.h ----
+# ---- 秒杀：移植自 tools/game-mod/kill.h ----
 KILL_SEND_OFF = 0x63FBB0              # 发包函数，序言 0x51EC8B55
 KILL_DAMAGE_OFF = 0x5F29F0            # thiscall 伤害调用，序言 0x83EC8B55
 KILL_HEALTH_OFF = 0x5E45B0            # 目标血量读取，序言 0x81EC8B55
-POISON_APPLY_OFF = 0x5C69C0           # 效果施加，序言 0x81EC8B55
-POISON_NOTIFY_OFF = 0x5C5580          # 效果通知，序言 0x83EC8B55
-POISON_SRC_NOTIFY_OFF = 0x5E7480      # 来源侧通知，序言 0x51EC8B55
-NPC_TYPE_OFFSET = 0xEF6B00            # CNpc RTTI type descriptor（本机 gfxz.dat）
 
 
 def now_ms():
@@ -244,21 +240,7 @@ def list_actors(handle, manager):
     return not pending, out
 
 
-def is_npc(handle, base, actor):
-    """actor=(ptr,state,uid)；CNpc RTTI 判定，排除玩家/宠物。返回 (ok, vftable)。"""
-    vt = read_u32(handle, actor[0])
-    if not vt:
-        return False, 0
-    col = read_u32(handle, vt - 4)
-    if not col:
-        return False, 0
-    type_ = read_u32(handle, col + 12)
-    if not type_:
-        return False, 0
-    return type_ == base + NPC_TYPE_OFFSET, vt
-
-
-def make_kill(handle, base, own, enemy, poison=False, reasons=None):
+def make_kill(handle, base, own, enemy, reasons=None):
     """移植 makeKill：全部前置检查通过后生成调用参数；失败返回 None。
     own/enemy 为 (ptr, state, uid)；reasons 收集拒绝原因，供状态行诊断显示。"""
     def refuse(tag):
@@ -280,7 +262,7 @@ def make_kill(handle, base, own, enemy, poison=False, reasons=None):
     enemy_team = read_u32(handle, enemy[0] + 0x28)
     if own_team is None or enemy_team is None:
         return refuse("内存读取失败")
-    if not poison and own_team == enemy_team:
+    if own_team == enemy_team:
         return refuse("同队")
     manager = read_u32(handle, base + MANAGER_PTR)
     if not manager:
@@ -289,10 +271,9 @@ def make_kill(handle, base, own, enemy, poison=False, reasons=None):
     if not context:
         return refuse("无轮次上下文")
 
-    k = {"poison": poison, "source": own[0], "target": enemy[0], "state": enemy[1],
+    k = {"source": own[0], "target": enemy[0], "state": enemy[1],
          "send": base + KILL_SEND_OFF, "damage": base + KILL_DAMAGE_OFF,
-         "health": base + KILL_HEALTH_OFF, "notify": base + POISON_NOTIFY_OFF,
-         "source_notify": base + POISON_SRC_NOTIFY_OFF,
+         "health": base + KILL_HEALTH_OFF,
          "bits": struct.unpack("<I", struct.pack("<f", 9999.0))[0],
          "packet": bytearray(94), "effect": [0] * 8, "guards": []}
     pkt = k["packet"]
@@ -315,44 +296,10 @@ def make_kill(handle, base, own, enemy, poison=False, reasons=None):
                    (a[0] + 0xC94, (a[2] >> 32) & 0xFFFFFFFF),
                    (a[0] + 0x1A6C, a[1]), (a[0] + 0x7C, 1)]
     guards += [(own[0] + 0x28, own_team), (enemy[0] + 0x28, enemy_team)]
-    if poison:
-        ok, vt = is_npc(handle, base, enemy)
-        if not ok:
-            return refuse("非CNpc类型")
-        k["damage"] = base + POISON_APPLY_OFF
-        pkt = bytearray(94)  # 实际发送长度 87，高位保持 0
-        pkt[4:12] = struct.pack("<Q", own[2])
-        pkt[39:47] = struct.pack("<Q", enemy[2])
-        pkt[47:55] = struct.pack("<Q", own[2])
-        pkt[55:59] = struct.pack("<I", 1)        # code
-        pkt[59:63] = struct.pack("<I", 1)        # level
-        pkt[63:67] = struct.pack("<I", 3000)     # duration
-        pkt[75:79] = struct.pack("<I", 1)        # operation
-        pkt[79:87] = struct.pack("<Q", context)
-        k["packet"] = pkt
-        effect = k["effect"]
-        effect[0], effect[1], effect[2], effect[4] = 1, 1, 3000, own[2] & 0xFFFFFFFF
-        effect[5], effect[6] = (own[2] >> 32) & 0xFFFFFFFF, 1
-        weapon_slot = read_u32(handle, enemy[0] + 0xCB0)
-        if weapon_slot is None:
-            return refuse("内存读取失败")
-        # 与 C++ 一致：仅读取失败才拒绝；武器信息为 0 也允许施放
-        weapon = read_u32(handle, enemy[0] + (0xCC0 if weapon_slot else 0xCC4))
-        if weapon is None:
-            return refuse("内存读取失败")
-        if weapon:
-            weapon_info = read_u32(handle, weapon + 0x37C)
-            if weapon_info is None:
-                return refuse("内存读取失败")
-            effect[7] = weapon_info
-        guards += [(enemy[0], vt), (enemy[1], enemy[0])]
 
     # 函数序言与连接时的文件哈希同样作为版本门禁
-    checks = [(k["send"], 0x51EC8B55), (k["health"], 0x81EC8B55),
-              (k["damage"], 0x81EC8B55 if poison else 0x83EC8B55)]
-    if poison:
-        checks += [(k["notify"], 0x83EC8B55), (k["source_notify"], 0x51EC8B55)]
-    for addr, expect in checks:
+    for addr, expect in ((k["send"], 0x51EC8B55), (k["health"], 0x81EC8B55),
+                         (k["damage"], 0x83EC8B55)):
         if read_u32(handle, addr) != expect:
             return refuse("函数序言不符")
     return k
@@ -422,19 +369,11 @@ def kill_code(code_base, data_base, k):
         c.word(0x7F800000)
         c.bytes_((0x0F, 0x83))
         stale.append(c.hole())
-    if k["poison"]:
-        c.push(1)
-        c.push(data_base + 160)
-        c.bytes_((0xB9,))
-        c.word(k["state"])
-        c.call(k["damage"])
-        c.bytes_((0x85, 0xC0, 0x0F, 0x84))
-        stale.append(c.hole())
     c.push(0)
     c.push(0)
-    c.push(87 if k["poison"] else 94)
+    c.push(94)
     c.push(data_base)
-    c.push(8150 if k["poison"] else 8121)
+    c.push(8121)
     c.call(k["send"])
     c.bytes_((0x83, 0xC4, 0x14))
     # 发包后复查：并发换局时不得触碰旧角色
@@ -444,29 +383,17 @@ def kill_code(code_base, data_base, k):
         c.word(g[1])
         c.bytes_((0x0F, 0x85))
         stale.append(c.hole())
-    rejected = 0
-    if k["poison"]:
-        c.push(data_base + 160)
-        c.bytes_((0xB9,))
-        c.word(k["state"])
-        c.call(k["notify"])
-        c.push(1)
-        c.push(k["source"])
-        c.bytes_((0xB9,))
-        c.word(k["target"])
-        c.call(k["source_notify"])
-    else:
-        c.push(0)
-        c.push(1)
-        c.push(0)
-        c.push(k["target"])
-        c.push(k["source"])
-        c.push(k["bits"])
-        c.bytes_((0xB9,))
-        c.word(k["target"])
-        c.call(k["damage"])  # thiscall，被调方回收 24 字节
-        c.bytes_((0x83, 0xF8, 0xFF, 0x0F, 0x84))
-        rejected = c.hole()
+    c.push(0)
+    c.push(1)
+    c.push(0)
+    c.push(k["target"])
+    c.push(k["source"])
+    c.push(k["bits"])
+    c.bytes_((0xB9,))
+    c.word(k["target"])
+    c.call(k["damage"])  # thiscall，被调方回收 24 字节
+    c.bytes_((0x83, 0xF8, 0xFF, 0x0F, 0x84))
+    rejected = c.hole()
     c.status(data_base + 128, 1)
     c.bytes_((0xE9,))
     success = c.hole()
@@ -493,8 +420,7 @@ def kill_code(code_base, data_base, k):
     c.bytes_((0x33, 0xC0, 0xC3))
     for p in stale:
         c.rel(p, skip)
-    if rejected:
-        c.rel(rejected, reject)
+    c.rel(rejected, reject)
     c.rel(success, cleanup)
     c.rel(skipped, cleanup)
     c.rel(reject_jump, cleanup)
@@ -779,9 +705,9 @@ def self_test():
     lifesteal = Feature(FEATURES[5])
     ok = ok and feature_desired("10", lifesteal) == (0x3F800000, True)  # 10 × 0.1 = 1.0f
 
-    # ---- 秒杀/中毒（kill.h 移植）：本进程合成内存，不注入任何代码 ----
+    # ---- 秒杀（kill.h 移植）：本进程合成内存，不注入任何代码 ----
     enemy, enemy_state = base + 0x9000, base + 0x9100
-    node2, weapon, vtable, col = base + 0x2200, base + 0x9200, base + 0x9300, base + 0x9400
+    node2 = base + 0x2200
     enemy_uid = uid + 1
     put(node + 8, node2)     # 树：own → enemy
     put(node2, head)         # node2.left
@@ -806,10 +732,9 @@ def self_test():
     # 函数序言未写入 → 全部拒绝（拒绝原因可诊断）
     reasons = {}
     ok = ok and make_kill(handle, base, (actor, state, uid),
-                          (enemy, enemy_state, enemy_uid), False, reasons) is None
+                          (enemy, enemy_state, enemy_uid), reasons) is None
     ok = ok and reasons.get("函数序言不符") == 1
-    prologues = {0x63FBB0: 0x51EC8B55, 0x5E45B0: 0x81EC8B55, 0x5F29F0: 0x83EC8B55,
-                 0x5C69C0: 0x81EC8B55, 0x5C5580: 0x83EC8B55, 0x5E7480: 0x51EC8B55}
+    prologues = {0x63FBB0: 0x51EC8B55, 0x5E45B0: 0x81EC8B55, 0x5F29F0: 0x83EC8B55}
     for off, value in prologues.items():
         put(base + off, value)
 
@@ -817,7 +742,7 @@ def self_test():
     # 同队拒绝秒杀，且原因计数可见
     put(enemy + 0x28, 1)
     reasons = {}
-    ok = ok and make_kill(handle, base, own_a, enemy_a, False, reasons) is None
+    ok = ok and make_kill(handle, base, own_a, enemy_a, reasons) is None
     ok = ok and reasons.get("同队") == 1
     put(enemy + 0x28, 2)
     k = make_kill(handle, base, own_a, enemy_a)
@@ -828,42 +753,15 @@ def self_test():
         ok = ok and struct.unpack_from("<Q", k["packet"], 86)[0] == 0x1234567800000007
         ok = ok and len(k["guards"]) == 13
 
-    # 中毒：RTTI 链不匹配拒绝；命中 CNpc 后字段齐全
-    put(enemy, vtable)
-    put(vtable - 4, col)
-    put(col + 12, base + 0xEF6B01)  # 非 CNpc
-    ok = ok and make_kill(handle, base, own_a, enemy_a, True) is None
-    put(col + 12, base + 0xEF6B00)
-    put(enemy + 0xCB0, 0)    # 武器槽 0 → 从 +0xCC4 取
-    put(enemy + 0xCC4, weapon)
-    put(weapon + 0x37C, 0x55AA)
-    p = make_kill(handle, base, own_a, enemy_a, True)
-    ok = ok and bool(p)
-    if p:
-        ok = ok and p["damage"] == base + POISON_APPLY_OFF
-        ok = ok and struct.unpack_from("<I", p["packet"], 55)[0] == 1
-        ok = ok and struct.unpack_from("<I", p["packet"], 59)[0] == 1
-        ok = ok and struct.unpack_from("<I", p["packet"], 63)[0] == 3000
-        ok = ok and struct.unpack_from("<I", p["packet"], 75)[0] == 1
-        ok = ok and struct.unpack_from("<Q", p["packet"], 79)[0] == 0x1234567800000007
-        ok = ok and p["effect"] == [1, 1, 3000, 0, uid & 0xFFFFFFFF, 0, 1, 0x55AA]
-        ok = ok and len(p["guards"]) == 15
-        ok = ok and p["guards"][-2] == (enemy, vtable) \
-            and p["guards"][-1] == (enemy_state, enemy)
-
-    # 武器信息为 0 不再拒绝（与 C++ 一致：仅读取失败才拒绝）
-    put(weapon + 0x37C, 0)
-    p0 = make_kill(handle, base, own_a, enemy_a, True)
-    ok = ok and p0 is not None and p0["effect"][7] == 0
-    put(weapon + 0x37C, 0x55AA)
-
     # 轮次状态行：拒绝原因分布
-    ok = ok and round_summary(2, 3, {"同队": 2, "非CNpc类型": 1}, False) \
-        == "本次结束：完成 2，跳过 3（同队×2，非CNpc类型×1）。"
+    ok = ok and round_summary(2, 3, {"同队": 2, "目标未激活": 1}, False) \
+        == "本次结束：完成 2，跳过 3（同队×2，目标未激活×1）。"
     ok = ok and round_summary(0, 0, {}, True) == "已停止：完成 0，跳过 0。"
 
     # shellcode 结构完整性（语义已由 C++ killSelfTest 在真机上验证）
-    code = kill_code(0x10000000, 0x20000000, k or p)
+    code = kill_code(0x10000000, 0x20000000, k or {"guards": [], "health": 0,
+                                                   "target": 0, "send": 0, "source": 0,
+                                                   "bits": 0, "damage": 0})
     tail = code.rfind(b"\xC2\x04\x00")
     ok = ok and len(code) <= 4096 and code[0] == 0x55 and code[1] == 0x8B and code[2] == 0xEC
     ok = ok and tail != -1 and struct.unpack_from("<I", code, 11)[0] == 0x10000000 + tail + 3
@@ -874,29 +772,6 @@ def self_test():
     ok = ok and not round_due(1800, 1000, True, False, True)
     ok = ok and not round_due(1800, 1000, False, True, True)
     ok = ok and not round_due(1800, 1000, False, False, False)
-
-    stamps = []
-    npc = (enemy, enemy_state, enemy_uid)
-
-    def stamp(a, when):
-        for i, s in enumerate(stamps):
-            if s[2] == a[2]:
-                stamps[i] = (a[0], a[1], a[2], when)
-                return
-        if len(stamps) >= 128:
-            stamps.pop(0)
-        stamps.append((a[0], a[1], a[2], when))
-
-    def due(a, when):
-        for ptr, st, uid_, t in stamps:
-            if ptr == a[0] and st == a[1] and uid_ == a[2]:
-                return when - t >= 4000
-        return True
-
-    stamp(npc, 1000)
-    ok = ok and not due(npc, 4999) and due(npc, 5000)
-    npc2 = (enemy, enemy_state + 1, enemy_uid)  # state 变化 → 视为新目标
-    ok = ok and due(npc2, 1001)
 
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
@@ -927,7 +802,7 @@ def run_ui():
             self.actor = None
             self.pids = []
             self.features = [Feature(spec) for spec in FEATURES]
-            # 秒杀/中毒调度状态（对应 kill.h 全局）
+            # 秒杀调度状态（对应 kill.h 全局）
             self.kill_job = KillJob()
             self.kill_queue = []
             self.kill_next = 0
@@ -938,7 +813,6 @@ def run_ui():
             self.disconnect_pending = False
             self.last_round = 0
             self.current_target = None
-            self.poison_stamps = []  # (ptr, state, uid, now_ms)
             self.round_reasons = {}  # 本轮拒绝原因计数（诊断）
 
             top = ttk.Frame(root)
@@ -975,14 +849,9 @@ def run_ui():
             killbox = ttk.LabelFrame(root, text="自动战斗（游戏原生调用：SEH 守卫 + 轮次复查）")
             killbox.pack(fill="x", padx=12, pady=(0, 4))
             self.kill_var = tk.BooleanVar(value=False)
-            self.poison_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(killbox, text="自动秒杀敌方（9999 伤害，每 400ms 一轮）",
                             variable=self.kill_var,
                             command=self.save_settings).grid(row=0, column=0, sticky="w",
-                                                             padx=8, pady=4)
-            ttk.Checkbutton(killbox, text="NPC 中毒（1 级 / 3 秒，每 4 秒补一次）",
-                            variable=self.poison_var,
-                            command=self.save_settings).grid(row=0, column=1, sticky="w",
                                                              padx=8, pady=4)
             self.kill_status = tk.StringVar(value="进入有敌方角色的战斗后自动执行。")
             ttk.Label(killbox, textvariable=self.kill_status, wraplength=520,
@@ -1014,7 +883,6 @@ def run_ui():
                 entry.delete(0, "end")
                 entry.insert(0, str(item.get("value", f.initial)))
             self.kill_var.set(bool(data.get("kill", False)))
-            self.poison_var.set(bool(data.get("poison", False)))
 
         def save_settings(self):
             path = settings_path()
@@ -1023,8 +891,7 @@ def run_ui():
             data = {"features": [{"enabled": self.rows[i][0].get(),
                                   "value": self.rows[i][1].get()}
                                  for i in range(len(self.features))],
-                    "kill": self.kill_var.get(),
-                    "poison": self.poison_var.get()}
+                    "kill": self.kill_var.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -1103,7 +970,7 @@ def run_ui():
                 # 不强杀线程：等当前原生调用返回后再断开（kill.h 同款语义）
                 self.disconnect_pending = True
                 if not silent:
-                    self.status.set("等待秒杀/中毒调用结束后断开；勾选已保留。")
+                    self.status.set("等待秒杀调用结束后断开；勾选已保留。")
                 return False
             if k32.WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0:
                 self.actor = None  # 游戏已退出，原值无法也无需恢复
@@ -1162,7 +1029,6 @@ def run_ui():
             actor = resolve_actor(self.handle, manager, uid) if manager and uid else None
             if not actor or not actor[1]:
                 self.actor = None
-                self.poison_stamps.clear()  # 换局/大厅：补毒时间戳失效（kill.h 同款）
                 self.restore_all()
                 for _enabled, _entry, value in self.rows:
                     value.set("—")
@@ -1171,7 +1037,6 @@ def run_ui():
             if actor != self.actor:
                 self.actor = None  # 换局：旧内存不回写，仅清除标记
                 self.restore_all()
-                self.poison_stamps.clear()
                 self.actor = actor
             error = False
             for i, f in enumerate(self.features):
@@ -1205,21 +1070,6 @@ def run_ui():
         def kill_busy(self):
             return self.kill_job.busy() or self.kill_next < len(self.kill_queue)
 
-        def poison_due(self, actor, now):
-            for ptr, state, uid, when in self.poison_stamps:
-                if ptr == actor[0] and state == actor[1] and uid == actor[2]:
-                    return now - when >= 4000
-            return True
-
-        def stamp_poison(self, actor, now):
-            for i, stamp in enumerate(self.poison_stamps):
-                if stamp[2] == actor[2]:
-                    self.poison_stamps[i] = (actor[0], actor[1], actor[2], now)
-                    return
-            if len(self.poison_stamps) >= 128:
-                self.poison_stamps.pop(0)
-            self.poison_stamps.append((actor[0], actor[1], actor[2], now))
-
         def poll_kill(self):
             if not self.kill_busy():
                 return
@@ -1233,8 +1083,6 @@ def run_ui():
                     return
                 target = self.current_target
                 if target and result == 1:
-                    if target[1]:
-                        self.stamp_poison(target[0], now_ms())
                     self.kill_done += 1
                 else:
                     self.kill_skipped += 1
@@ -1248,13 +1096,12 @@ def run_ui():
                         self.auto_fault = True
                 self.current_target = None
             while not self.kill_cancel and self.kill_next < len(self.kill_queue):
-                actor, poison = self.kill_queue[self.kill_next]
+                actor = self.kill_queue[self.kill_next]
                 self.kill_next += 1
-                want = self.poison_var.get() if poison else self.kill_var.get()
-                if not want:
+                if not self.kill_var.get():
                     self.kill_skipped += 1
                     continue
-                k = make_kill(self.handle, self.base, self.actor, actor, poison,
+                k = make_kill(self.handle, self.base, self.actor, actor,
                               self.round_reasons) if self.actor else None
                 if not k:
                     self.kill_skipped += 1
@@ -1264,7 +1111,7 @@ def run_ui():
                     self.auto_fault = True
                     self.kill_skipped += 1
                     break
-                self.current_target = (actor, poison)
+                self.current_target = actor
                 return
             self.kill_queue.clear()
             self.kill_next = 0
@@ -1296,18 +1143,12 @@ def run_ui():
             self.kill_next = self.kill_done = self.kill_skipped = 0
             self.kill_cancel = False
             self.round_reasons = {}
-            now = now_ms()
             for a in actors:
-                if self.poison_var.get() and self.poison_due(a, now):
-                    k = make_kill(self.handle, self.base, self.actor, a, True,
-                                  self.round_reasons)
-                    if k:
-                        self.kill_queue.append((a, True))
                 if self.kill_var.get():
-                    k = make_kill(self.handle, self.base, self.actor, a, False,
+                    k = make_kill(self.handle, self.base, self.actor, a,
                                   self.round_reasons)
                     if k:
-                        self.kill_queue.append((a, False))
+                        self.kill_queue.append(a)
             if not self.kill_queue:
                 self.kill_status.set("已勾选，等待可操作目标；" +
                                      round_summary(0, 0, self.round_reasons, False))
@@ -1317,7 +1158,7 @@ def run_ui():
 
         def auto_tick(self):
             self.poll_kill()
-            wanted = self.kill_var.get() or self.poison_var.get()
+            wanted = self.kill_var.get()
             if wanted and self.actor and \
                     round_due(now_ms(), self.last_round, self.kill_busy(),
                               self.auto_fault or self.disconnect_pending, wanted):
@@ -1325,7 +1166,7 @@ def run_ui():
                 self.start_kill()
 
         def auto_loop(self):
-            # 秒杀/中毒独立 30ms 循环（C++ 版为 20ms 定时器），不随属性 tick 变慢
+            # 秒杀独立 30ms 循环（C++ 版为 20ms 定时器），不随属性 tick 变慢
             if self.handle:
                 self.auto_tick()
             self.root.after(30, self.auto_loop)
