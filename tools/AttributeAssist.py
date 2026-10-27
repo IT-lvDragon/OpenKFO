@@ -437,14 +437,13 @@ def find_main_window(pid):
 
 
 def send_move_key(hwnd, vk, down):
-    """SendInput 注入真实键盘事件（系统级输入，DirectInput 游戏也能识别）。
+    """SendInput 注入键盘事件——扫描码模式（DirectInput 老游戏只认扫描码）。
     仅当游戏窗口为前台时由 move_tick 调用；hwnd 供前台比对。"""
     lib = user32()
     lib.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
     lib.SendInput.restype = wintypes.UINT
-    lib.GetForegroundWindow.restype = wintypes.HWND
     inp = INPUT(type=1)  # INPUT_KEYBOARD
-    inp.union.ki.wVk = vk
+    inp.union.ki.wScan = kb_scancode(vk)
     inp.union.ki.dwFlags = kb_flags(vk, down)
     return lib.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
 
@@ -482,10 +481,23 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("union", _INPUTUNION)]
 
 
+KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE = 0x0001, 0x0002, 0x0008
+MAPVK_VK_TO_VSC = 0
+EXTENDED_VKS = {0x25, 0x26, 0x27, 0x28}  # ←↑→↓
+
+
+def kb_scancode(vk):
+    """虚键码 → 扫描码（DirectInput 游戏轮询的是扫描码）。"""
+    lib = user32()
+    lib.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    lib.MapVirtualKeyW.restype = wintypes.UINT
+    return lib.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+
+
 def kb_flags(vk, down):
-    """SendInput 键盘标志：普通键按下 0 / 抬起 2；方向键为扩展键需 8 位。"""
-    ext = 8 if vk in (0x25, 0x26, 0x27, 0x28) else 0
-    return (ext | 2) if not down else ext
+    """SendInput 标志（扫描码模式）：8=按扫描码注入，1=扩展键，2=抬起。"""
+    flags = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_VKS else 0)
+    return flags if down else flags | KEYEVENTF_KEYUP
 
 
 def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
@@ -907,9 +919,9 @@ def self_test():
         and MOVE_KEYS["左(←)"] == 0x25 and MOVE_KEYS["上(↑)"] == 0x26 \
         and MOVE_KEYS["下(↓)"] == 0x28
 
-    # SendInput 键盘标志：方向键为扩展键（8），普通键抬起置 2
-    ok = ok and kb_flags(0x44, True) == 0 and kb_flags(0x44, False) == 2
-    ok = ok and kb_flags(0x27, True) == 8 and kb_flags(0x27, False) == 10
+    # SendInput 标志（扫描码模式）：8=SCANCODE，1=EXTENDEDKEY，2=KEYUP
+    ok = ok and kb_flags(0x44, True) == 8 and kb_flags(0x44, False) == 10
+    ok = ok and kb_flags(0x27, True) == 9 and kb_flags(0x27, False) == 11
 
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
@@ -1355,6 +1367,8 @@ def run_ui():
                     send_move_key(self.move_hwnd, vk, False)
                     self.move_pressed = False
                     self.move_phase_at = 0
+                if self.move_var.get() and self.handle:
+                    self.move_status.set("已勾选；检测到角色（进战斗）后开始。")
                 return
             if not self.move_hwnd or not user32().IsWindow(self.move_hwnd):
                 self.move_hwnd = find_main_window(self.pid)
