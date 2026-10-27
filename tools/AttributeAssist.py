@@ -1229,8 +1229,10 @@ def run_ui():
         def auto_tick(self):
             self.poll_kill()
             # 自杀/秒杀延迟起算点：检测到角色地址（进入战斗）才开始计时；角色消失重新武装
-            self.suicide_armed_at = arm_delay(self.suicide_var.get(), self.suicide_armed_at)
-            self.kill_armed_at = arm_delay(self.kill_var.get(), self.kill_armed_at)
+            self.suicide_armed_at = self.arm_delay(self.suicide_var.get(),
+                                                   self.suicide_armed_at)
+            self.kill_armed_at = self.arm_delay(self.kill_var.get(),
+                                                self.kill_armed_at)
             wanted = self.kill_var.get() or self.suicide_var.get()
             if wanted and self.actor and \
                     round_due(now_ms(), self.last_round, self.kill_busy(),
