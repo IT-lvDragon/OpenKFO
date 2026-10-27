@@ -54,6 +54,11 @@ KILL_HEALTH_OFF = 0x5E45B0            # 目标血量读取，序言 0x81EC8B55
 # ---- Win32 绑定 ----
 k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
 _handle = wintypes.HANDLE
+k32.GetCurrentProcess.restype = _handle
+k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+k32.VirtualAlloc.restype = _handle
+k32.VirtualFree.argtypes = [_handle, ctypes.c_void_p, wintypes.DWORD]
+k32.VirtualFree.restype = wintypes.BOOL
 
 
 class PROCESSENTRY32W(ctypes.Structure):
@@ -621,7 +626,11 @@ class KillJob:
 # ---- 自检：本进程合成内存，不注入任何代码 ----
 def self_test():
     handle = k32.GetCurrentProcess() or 0
-    buffer = k32.VirtualAlloc(None, 0x1400000, MEM_COMMIT_RESERVE, PAGE_READWRITE) or 0
+    # 合成树节点存 32 位指针：必须在低 4GB 分配（wine/64 位 Python 默认高地址会截断）
+    buffer = k32.VirtualAlloc(0x00800000, 0x1400000, MEM_COMMIT_RESERVE, PAGE_READWRITE) or 0
+    if buffer >= 0x100000000:
+        k32.VirtualFree(buffer, 0, MEM_RELEASE)
+        buffer = 0
     if not buffer:
         print("self-test: FAILED (no memory)")
         return 2
@@ -631,7 +640,10 @@ def self_test():
     uid = 123456789
 
     def put(a, v):
-        assert write_u32(handle, a, v)
+        if not write_u32(handle, a, v):
+            print("put FAILED at %s err %s base %s" %
+                  (hex(a), ctypes.get_last_error(), hex(base)))
+            raise SystemExit(3)
 
     ok = True
     put(manager + 0x2F0, head)
