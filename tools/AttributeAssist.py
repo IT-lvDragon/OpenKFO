@@ -9,6 +9,7 @@ WriteProcessMemory），不注入 DLL、不修改任何游戏文件。取消勾�
 用法：
   python AttributeAssist.py           打开界面：选择游戏进程 → 点击“启动”
   python AttributeAssist.py --self-test  无界面自检（校验角色定位与恢复逻辑）
+  python AttributeAssist.py --list    诊断：打印全部进程名并标记游戏进程
 
 仅限本地单机环境使用；写入前会校验客户端 SHA-256，
 与本机已核对的 gfxz.dat 不符时拒绝连接。
@@ -228,24 +229,56 @@ def format_value(bits, is_int):
 
 
 # ---- 进程枚举 ----
-def find_processes():
+LAST_SNAP_ERROR = ""
+
+
+def find_processes(want_all=False):
+    """枚举进程；want_all=True 返回全部进程（诊断用）。失败时写入 LAST_SNAP_ERROR。"""
+    global LAST_SNAP_ERROR
     out = []
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) or 0
-    if not snap or snap == INVALID_HANDLE:
+    LAST_SNAP_ERROR = ""
+    snap = 0
+    for _attempt in range(2):  # 快照偶发 ERROR_BAD_LENGTH，重试一次
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) or 0
+        if snap and snap != INVALID_HANDLE:
+            break
+        LAST_SNAP_ERROR = f"CreateToolhelp32Snapshot 失败（错误码 {ctypes.get_last_error()}）"
+        snap = 0
+    if not snap:
         return out
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(entry)
-        if k32.Process32FirstW(snap, ctypes.byref(entry)):
-            while True:
-                name = entry.szExeFile
-                if name.lower() in GAME_NAMES:
-                    out.append((entry.th32ProcessID, name))
-                if not k32.Process32NextW(snap, ctypes.byref(entry)):
-                    break
+        if not k32.Process32FirstW(snap, entry):
+            LAST_SNAP_ERROR = (f"Process32FirstW 失败（错误码 {ctypes.get_last_error()}，"
+                               f"{sys.maxsize * 8 + 4} 位 Python，结构体大小 {entry.dwSize}）")
+            return out
+        while True:
+            name = entry.szExeFile
+            if want_all or name.lower() in GAME_NAMES:
+                out.append((entry.th32ProcessID, name))
+            if not k32.Process32NextW(snap, entry):
+                break
     finally:
         k32.CloseHandle(snap)
     return out
+
+
+def list_processes():
+    """--list 诊断：打印全部进程名，便于核对游戏实际 exe 名。"""
+    procs = find_processes(want_all=True)
+    if not procs:
+        print(LAST_SNAP_ERROR or "进程列表为空。")
+        return 1
+    matches = [(pid, name) for pid, name in procs if name.lower() in GAME_NAMES]
+    print(f"共 {len(procs)} 个进程；匹配游戏：{len(matches)} 个")
+    for pid, name in sorted(procs):
+        mark = "   <== 游戏进程" if name.lower() in GAME_NAMES else ""
+        print(f"  {name}  ·  PID {pid}{mark}")
+    if not matches:
+        print("未发现 gfxz.dat / gfld.dat —— 请确认游戏已启动；若游戏 exe 名不同，"
+              "把上面列表里的名字发我以加入匹配。")
+    return 0
 
 
 def module_base(pid):
@@ -255,7 +288,7 @@ def module_base(pid):
     entry = MODULEENTRY32W()
     entry.dwSize = ctypes.sizeof(entry)
     base = 0
-    if k32.Module32FirstW(snap, ctypes.byref(entry)) and entry.modBaseAddr:
+    if k32.Module32FirstW(snap, entry) and entry.modBaseAddr:
         base = int(entry.modBaseAddr)
     k32.CloseHandle(snap)
     return base
@@ -435,9 +468,12 @@ def run_ui():
             return 0
 
         def refresh(self):
+            self.root.after(1000, self.refresh)  # 先续约：下方任何分支提前返回都不中断刷新
             found = find_processes()
             if [pid for pid, _name in found] == self.pids:
                 return
+            if not found and LAST_SNAP_ERROR:
+                self.status.set(LAST_SNAP_ERROR + "；每秒自动重试。")
             preferred = self.selected_pid()
             self.pids = [pid for pid, _name in found]
             self.combo["values"] = [f"{name}  ·  PID {pid}" for pid, name in found]
@@ -450,7 +486,6 @@ def run_ui():
                 self.combo.current(index)
             else:
                 self.combo.set("")
-            self.root.after(1000, self.refresh)
 
         # -- 连接与断开 --
         def connect(self):
@@ -589,6 +624,8 @@ def main():
         return 1
     if "--self-test" in sys.argv:
         return self_test()
+    if "--list" in sys.argv:
+        return list_processes()
     return run_ui()
 
 
