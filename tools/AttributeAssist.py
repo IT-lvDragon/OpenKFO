@@ -496,6 +496,31 @@ def kb_scancode(vk):
     return lib.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
 
 
+_psapi = None
+
+
+def psapi():
+    """psapi 惰性绑定：EmptyWorkingSet 裁剪目标进程工作集（仅 Windows 实际调用）。"""
+    global _psapi
+    if _psapi is None:
+        _psapi = ctypes.WinDLL("psapi.dll", use_last_error=True)
+        _psapi.EmptyWorkingSet.argtypes = [_handle]
+        _psapi.EmptyWorkingSet.restype = wintypes.BOOL
+    return _psapi
+
+
+def parse_minutes(text, default=10):
+    """自动清理间隔解析：分钟；空/非法回退默认；范围 1–1440。"""
+    text = str(text).strip()
+    if not text:
+        return default
+    try:
+        value = int(float(text))
+    except ValueError:
+        return default
+    return max(1, min(value, 1440))
+
+
 def kb_flags(vk, down):
     """SendInput 标志（扫描码模式）：8=按扫描码注入，1=扩展键，2=抬起。"""
     flags = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_VKS else 0)
@@ -933,6 +958,11 @@ def self_test():
     ok = ok and kb_flags(0x44, True) == 8 and kb_flags(0x44, False) == 10
     ok = ok and kb_flags(0x27, True) == 9 and kb_flags(0x27, False) == 11
 
+    # 自动清理间隔解析：空/非法回退 10；下限 1 上限 1440 分钟
+    ok = ok and parse_minutes("") == 10 and parse_minutes("abc") == 10
+    ok = ok and parse_minutes("0") == 1 and parse_minutes("99999") == 1440 \
+        and parse_minutes("5") == 5
+
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 2
@@ -981,6 +1011,23 @@ def run_ui():
             self.combo.grid(row=0, column=0, padx=(0, 8))
             ttk.Button(top, text="启动", command=self.connect).grid(row=0, column=1, padx=(0, 4))
             ttk.Button(top, text="停止并断开", command=self.stop_clicked).grid(row=0, column=2)
+            ttk.Button(top, text="清理游戏内存", command=self.clean_memory).grid(row=0, column=3,
+                                                                                 padx=(8, 0))
+
+            memframe = ttk.Frame(root)
+            memframe.pack(fill="x", padx=12, pady=(0, 2))
+            self.mem_auto = tk.BooleanVar(value=False)
+            self.mem_every = tk.StringVar(value="10")
+            self.mem_last_clean = 0
+            ttk.Checkbutton(memframe, text="定时清理游戏工作集，每",
+                            variable=self.mem_auto,
+                            command=self.on_mem_toggle).pack(side="left")
+            ttk.Entry(memframe, textvariable=self.mem_every, width=4).pack(side="left")
+            ttk.Label(memframe, text="分钟（治标：把内存页换出；泄漏块本身无法外部回收）").pack(
+                side="left", padx=(4, 8))
+            self.mem_status = tk.StringVar(
+                value="清理后游戏首次访问被换出页面时可能短暂卡顿，属正常现象。")
+            ttk.Label(memframe, textvariable=self.mem_status).pack(side="left")
 
             body = ttk.LabelFrame(root, text="功能（自动记住勾选与数值）")
             body.pack(fill="x", padx=12, pady=4)
@@ -1108,6 +1155,9 @@ def run_ui():
             self.move_key.set(str(data.get("move_key", "右(D)")))
             self.move_hold.set(str(data.get("move_hold", "2")))
             self.move_release.set(str(data.get("move_release", "0.5")))
+            self.mem_auto.set(bool(data.get("mem_auto", False)))
+            self.mem_every.set(str(data.get("mem_every", "10")))
+            self.mem_last_clean = now_ms()  # 恢复勾选后重新计时，避免启动即清
 
         def save_settings(self):
             path = settings_path()
@@ -1123,7 +1173,9 @@ def run_ui():
                     "move": self.move_var.get(),
                     "move_key": self.move_key.get(),
                     "move_hold": self.move_hold.get(),
-                    "move_release": self.move_release.get()}
+                    "move_release": self.move_release.get(),
+                    "mem_auto": self.mem_auto.get(),
+                    "mem_every": self.mem_every.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -1482,7 +1534,31 @@ def run_ui():
             if self.handle:
                 self.auto_tick()
             self.move_tick()
+            self.mem_tick()
             self.root.after(30, self.auto_loop)
+
+        def on_mem_toggle(self):
+            self.mem_last_clean = now_ms()  # 勾选即重新计时
+            self.save_settings()
+
+        def clean_memory(self):
+            """EmptyWorkingSet：请系统把游戏工作集页换出。治标不治本——泄漏块仍在，
+            但任务管理器内存数字回落、系统内存压力缓解。"""
+            if not self.handle:
+                self.mem_status.set("未连接游戏，无法清理。")
+                return
+            if psapi().EmptyWorkingSet(self.handle):
+                self.mem_status.set("已请求系统裁剪游戏工作集；游戏首次访问被换出页面时可能短暂卡顿。")
+            else:
+                self.mem_status.set("清理失败（错误码 %d）。" % ctypes.get_last_error())
+
+        def mem_tick(self):
+            if not self.mem_auto.get() or not self.handle:
+                return
+            interval = parse_minutes(self.mem_every.get()) * 60000
+            if now_ms() - self.mem_last_clean >= interval:
+                self.mem_last_clean = now_ms()
+                psapi().EmptyWorkingSet(self.handle)
 
         def on_close(self):
             if self.move_pressed:
