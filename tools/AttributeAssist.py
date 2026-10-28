@@ -457,6 +457,56 @@ def game_foreground(hwnd):
     return bool(hwnd) and lib.GetForegroundWindow() == hwnd
 
 
+# ---- 屏幕坐标点击（SendInput 鼠标，绝对坐标）----
+MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN = 0x0001, 0x0002
+MOUSEEVENTF_LEFTUP, MOUSEEVENTF_ABSOLUTE = 0x0004, 0x8000
+SM_CXSCREEN, SM_CYSCREEN = 0, 1
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+def screen_size():
+    """返回 (width, height)，供绝对坐标归一化。"""
+    lib = user32()
+    lib.GetSystemMetrics.argtypes = [ctypes.c_int]
+    lib.GetSystemMetrics.restype = ctypes.c_int
+    w = lib.GetSystemMetrics(SM_CXSCREEN) or 1
+    h = lib.GetSystemMetrics(SM_CYSCREEN) or 1
+    return w, h
+
+
+def click_at(x, y):
+    """在屏幕绝对坐标 (x, y) 处单击左键。SendInput 一次投递按下+抬起。"""
+    lib = user32()
+    lib.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    lib.SendInput.restype = wintypes.UINT
+    w, h = screen_size()
+    nx = int(int(x) * 65535 / max(w - 1, 1))
+    ny = int(int(y) * 65535 / max(h - 1, 1))
+    flags_move = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+    inputs = (INPUT * 2)()
+    inputs[0].type = 0  # INPUT_MOUSE
+    inputs[0].union.mi.dx = nx
+    inputs[0].union.mi.dy = ny
+    inputs[0].union.mi.dwFlags = flags_move | MOUSEEVENTF_LEFTDOWN
+    inputs[1].type = 0
+    inputs[1].union.mi.dwFlags = MOUSEEVENTF_LEFTUP
+    return lib.SendInput(2, inputs, ctypes.sizeof(INPUT)) == 2
+
+
+def get_cursor_pos():
+    """返回当前鼠标屏幕坐标 (x, y)；失败返回 None。"""
+    lib = user32()
+    lib.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+    lib.GetCursorPos.restype = wintypes.BOOL
+    pt = POINT()
+    if lib.GetCursorPos(ctypes.byref(pt)):
+        return pt.x, pt.y
+    return None
+
+
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
                 ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
