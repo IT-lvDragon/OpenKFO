@@ -114,6 +114,8 @@ k32.FlushInstructionCache.restype = wintypes.BOOL
 k32.CreateRemoteThread.argtypes = [_handle, ctypes.c_void_p, ctypes.c_size_t,
                                    ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
 k32.CreateRemoteThread.restype = _handle
+k32.TerminateThread.argtypes = [_handle, wintypes.DWORD]
+k32.TerminateThread.restype = wintypes.BOOL
 k32.QueryFullProcessImageNameW.argtypes = [_handle, wintypes.DWORD, ctypes.c_wchar_p,
                                            ctypes.POINTER(wintypes.DWORD)]
 k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
@@ -689,13 +691,16 @@ def kill_code(code_base, data_base, k):
 
 
 class KillJob:
-    """移植 KillJob：一次性远程线程调用，结束后回收内存，不使用 TerminateThread。"""
+    """一次性远程线程调用，结束后回收内存；超过 5 秒未完成则强杀线程回收资源。"""
+
+    TIMEOUT_SECONDS = 5.0
 
     def __init__(self):
         self.thread = 0
         self.block = 0
         self.started = 0.0
         self.start_error = 0
+        self.timed_out = False
 
     def busy(self):
         return bool(self.thread)
@@ -743,14 +748,19 @@ class KillJob:
     def poll(self, handle):
         if not self.thread:
             return -2
+        self.timed_out = False
         if k32.WaitForSingleObject(self.thread, 0) != WAIT_OBJECT_0:
-            return -1
+            # 正常未完成不释放；但超过 5 秒未返回说明原生函数卡死，强杀线程回收资源
+            if time.monotonic() - self.started < self.TIMEOUT_SECONDS:
+                return -1
+            self.timed_out = True
+            k32.TerminateThread(self.thread, 0)
         result = read_u32(handle, self.block + 4096 + 128) or 0
         k32.CloseHandle(self.thread)
         self.thread = 0
         k32.VirtualFreeEx(handle, ctypes.c_void_p(self.block), 0, MEM_RELEASE)
         self.block = 0
-        return result
+        return result if not self.timed_out else -3
 
 
 # ---- 自检：本进程合成内存，不注入任何代码 ----
@@ -1286,11 +1296,7 @@ def run_ui():
             if self.kill_job.busy():
                 result = self.kill_job.poll(self.handle)
                 if result == -1:
-                    if time.monotonic() - self.kill_job.started > 5.0:
-                        self.kill_cancel = True
-                        self.auto_fault = True
-                        self.kill_status.set("调用超时：自动操作已暂停，等待当前调用返回；不强杀线程。")
-                    return
+                    return  # 调用进行中，下一轮再查；超时由 poll 内部强杀回收
                 target = self.current_target
                 if target and result == 1:
                     self.kill_done += 1
@@ -1300,6 +1306,10 @@ def run_ui():
                         self.round_reasons["预检跳过"] = self.round_reasons.get("预检跳过", 0) + 1
                     elif result == 4:
                         self.round_reasons["原生拒绝"] = self.round_reasons.get("原生拒绝", 0) + 1
+                    elif result == -3:
+                        self.round_reasons["调用超时"] = self.round_reasons.get("调用超时", 0) + 1
+                        self.kill_cancel = True
+                        self.auto_fault = True
                     elif result != -2:
                         self.round_reasons[f"调用异常({result})"] = 1
                         self.kill_cancel = True
