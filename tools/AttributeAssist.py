@@ -593,105 +593,6 @@ def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
     return k
 
 
-# ---- 自动准备：移植 team_mod.h sendTeamReady（包类型 21900，包长 63）----
-# 原版在 startTeamProbe(registerNPC=true) 中调用：从 team plan(HTTP) 取
-# monsters/model/ai；这里用默认值，需要匹配服务端配置时可改输入框。
-READY_PKT_ID = 21900
-READY_PKT_LEN = 63
-
-
-def make_ready(handle, base, monsters=1, model=0, ai=0, reasons=None):
-    """构建团队怪物准备包。room/serial 从内存读取；失败返回 None。"""
-    def refuse(tag):
-        if reasons is not None:
-            reasons[tag] = reasons.get(tag, 0) + 1
-        return None
-
-    manager = read_u32(handle, base + MANAGER_PTR)
-    if not manager:
-        return refuse("无管理器")
-    room = read_u32(handle, manager + 0x311)
-    serial = read_u32(handle, manager + 0x315)
-    if not room or not serial:
-        return refuse("无 room/serial")
-    if read_u32(handle, base + KILL_SEND_OFF) != 0x51EC8B55:
-        return refuse("send 序言不符")
-
-    packet = bytearray(READY_PKT_LEN)
-    packet[39] = 100
-    struct.pack_into("<I", packet, 43, room)
-    struct.pack_into("<I", packet, 47, serial)
-    struct.pack_into("<I", packet, 51, monsters)
-    struct.pack_into("<I", packet, 55, model)
-    struct.pack_into("<I", packet, 59, ai)
-
-    return {
-        "send": base + KILL_SEND_OFF,
-        "packet": packet,
-        "effect": [0] * 8,
-        "guards": [
-            (base + MANAGER_PTR, manager),
-            (manager + 0x311, room),
-            (manager + 0x315, serial),
-        ],
-    }
-
-
-def ready_code(code_base, data_base, k):
-    """准备包远程线程代码：SEH 守卫 + 轮次复查 + 仅调用 send。"""
-    c = Code32()
-    stale = []
-    c.bytes_((0x55, 0x8B, 0xEC, 0x60, 0x83, 0xEC, 0x08))
-    c.bytes_((0xC7, 0x44, 0x24, 0x04))
-    handler = c.hole()
-    c.bytes_((0x64, 0xA1, 0, 0, 0, 0, 0x89, 0x04, 0x24, 0x64, 0x89, 0x25, 0, 0, 0, 0))
-    for g in k["guards"]:
-        c.bytes_((0x81, 0x3D))
-        c.word(g[0])
-        c.word(g[1])
-        c.bytes_((0x0F, 0x85))
-        stale.append(c.hole())
-    # send(21900, data_base, 63, 0, 0)
-    c.push(0)
-    c.push(0)
-    c.push(READY_PKT_LEN)
-    c.push(data_base)
-    c.push(READY_PKT_ID)
-    c.call(k["send"])
-    c.bytes_((0x83, 0xC4, 0x14))
-    # 复查守卫
-    for g in k["guards"]:
-        c.bytes_((0x81, 0x3D))
-        c.word(g[0])
-        c.word(g[1])
-        c.bytes_((0x0F, 0x85))
-        stale.append(c.hole())
-    c.status(data_base + 128, 1)
-    c.bytes_((0xE9,))
-    success = c.hole()
-    skip = len(c.b)
-    c.status(data_base + 128, 2)
-    c.bytes_((0xE9,))
-    skipped = c.hole()
-    fault = len(c.b)
-    c.status(data_base + 128, 3)
-    cleanup = len(c.b)
-    c.bytes_((0x8B, 0x04, 0x24, 0x64, 0xA3, 0, 0, 0, 0, 0x83, 0xC4, 0x08, 0x61, 0x33,
-              0xC0, 0x8B, 0xE5, 0x5D, 0xC2, 0x04, 0x00))
-    c.patch(handler, code_base + len(c.b))
-    c.bytes_((0x8B, 0x44, 0x24, 0x0C, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x90))
-    c.word(0xC4)
-    c.bytes_((0xC7, 0x80))
-    c.word(0xB8)
-    c.word(code_base + fault)
-    c.bytes_((0x33, 0xC0, 0xC3))
-    for p in stale:
-        c.rel(p, skip)
-    c.rel(success, cleanup)
-    c.rel(skipped, cleanup)
-    return bytes(c.b)
-
-
 class Code32:
     def __init__(self):
         self.b = bytearray()
@@ -829,7 +730,7 @@ class KillJob:
     def busy(self):
         return bool(self.thread)
 
-    def start(self, handle, k, code_fn=None):
+    def start(self, handle, k):
         if self.thread:
             return False
         self.start_error = 0
@@ -837,17 +738,16 @@ class KillJob:
         if not block:
             self.start_error = ctypes.get_last_error()
             return False
-        code = (code_fn or kill_code)(block, block + 4096, k)
+        code = kill_code(block, block + 4096, k)
         got = ctypes.c_size_t(0)
         ok = len(code) <= 4096
         if ok:
             ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block), bytes(code),
                                              len(code), ctypes.byref(got))) and got.value == len(code)
         if ok:
-            pkt_len = len(k["packet"])
             ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block + 4096),
-                                             bytes(k["packet"]), pkt_len,
-                                             ctypes.byref(got))) and got.value == pkt_len
+                                             bytes(k["packet"]), 94,
+                                             ctypes.byref(got))) and got.value == 94
         if ok:
             effect = (ctypes.c_uint32 * 8)(*k["effect"])
             ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block + 4096 + 160),
@@ -1063,39 +963,6 @@ def self_test():
     ok = ok and parse_minutes("0") == 1 and parse_minutes("99999") == 1440 \
         and parse_minutes("5") == 5
 
-    # ---- 自动准备（team_mod.h sendTeamReady 移植）----
-    # room=manager+0x311 的低 32 位=7，serial=高 32 位=0x12345678
-    reasons = {}
-    r = make_ready(handle, base, 2, 1, 0, reasons)
-    ok = ok and bool(r)
-    if r:
-        ok = ok and len(r["packet"]) == 63
-        ok = ok and r["packet"][39] == 100
-        ok = ok and struct.unpack_from("<I", r["packet"], 43)[0] == 7
-        ok = ok and struct.unpack_from("<I", r["packet"], 47)[0] == 0x12345678
-        ok = ok and struct.unpack_from("<I", r["packet"], 51)[0] == 2  # monsters
-        ok = ok and struct.unpack_from("<I", r["packet"], 55)[0] == 1  # model
-        ok = ok and struct.unpack_from("<I", r["packet"], 59)[0] == 0  # ai
-        ok = ok and len(r["guards"]) == 3
-        ok = ok and r["guards"][0] == (base + MANAGER_PTR, manager)
-        ok = ok and r["guards"][1] == (manager + 0x311, 7)
-        ok = ok and r["guards"][2] == (manager + 0x315, 0x12345678)
-    # send 序言不符 → 拒绝
-    put(base + KILL_SEND_OFF, 0)
-    ok = ok and make_ready(handle, base) is None
-    put(base + KILL_SEND_OFF, 0x51EC8B55)
-    # 无 room/serial → 拒绝
-    put(manager + 0x311, 0)
-    put(manager + 0x315, 0)
-    ok = ok and make_ready(handle, base) is None
-    write_mem(handle, manager + 0x311, struct.pack("<Q", 0x1234567800000007))
-    # ready_code shellcode 结构
-    rcode = ready_code(0x10000000, 0x20000000, r or {"guards": [], "send": 0})
-    ok = ok and len(rcode) <= 4096 and rcode[0] == 0x55 and rcode[1] == 0x8B and rcode[2] == 0xEC
-    ok = ok and rcode.rfind(b"\xC2\x04\x00") != -1
-    # 状态码写回次数：1(成功) / 2(跳过) / 3(异常)，无 4
-    ok = ok and rcode.count(struct.pack("<I", 0x20000000 + 128)) == 3
-
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 2
@@ -1214,39 +1081,6 @@ def run_ui():
                       justify="left").grid(row=2, column=0, columnspan=3, sticky="w",
                                            padx=8, pady=(0, 6))
 
-            readybox = ttk.LabelFrame(root, text="自动准备（团队怪物模式：发送 21900 准备包）")
-            readybox.pack(fill="x", padx=12, pady=(0, 4))
-            self.ready_var = tk.BooleanVar(value=False)
-            self.ready_monsters = tk.StringVar(value="1")
-            self.ready_model = tk.StringVar(value="0")
-            self.ready_ai = tk.StringVar(value="0")
-            self.ready_job = KillJob()
-            self.ready_last_room = 0
-            self.ready_last_serial = 0
-            self.ready_done = 0
-            self.ready_skipped = 0
-            self.ready_reasons = {}
-            ttk.Checkbutton(readybox, text="自动准备（进入有 room/serial 的团队场景后发包）",
-                            variable=self.ready_var,
-                            command=self.save_settings).grid(row=0, column=0, sticky="w",
-                                                             padx=8, pady=4)
-            ttk.Label(readybox, text="怪物数：").grid(row=0, column=1, sticky="e", pady=4)
-            ttk.Spinbox(readybox, from_=1, to=4, width=4,
-                        textvariable=self.ready_monsters,
-                        command=self.save_settings).grid(row=0, column=2, sticky="w", pady=4)
-            ttk.Label(readybox, text="模型：").grid(row=0, column=3, sticky="e", pady=4)
-            ttk.Spinbox(readybox, from_=0, to=2, width=4,
-                        textvariable=self.ready_model,
-                        command=self.save_settings).grid(row=0, column=4, sticky="w", pady=4)
-            ttk.Label(readybox, text="AI：").grid(row=0, column=5, sticky="e", pady=4)
-            ttk.Spinbox(readybox, from_=0, to=1, width=4,
-                        textvariable=self.ready_ai,
-                        command=self.save_settings).grid(row=0, column=6, sticky="w", pady=4)
-            self.ready_status = tk.StringVar(value="进入团队场景后自动发送准备包；换局自动重发。")
-            ttk.Label(readybox, textvariable=self.ready_status, wraplength=520,
-                      justify="left").grid(row=1, column=0, columnspan=7, sticky="w",
-                                            padx=8, pady=(0, 6))
-
             movebox = ttk.LabelFrame(root, text="自动跑图（后台按键模拟，不写内存）")
             movebox.pack(fill="x", padx=12, pady=(0, 4))
             self.move_var = tk.BooleanVar(value=False)
@@ -1324,12 +1158,6 @@ def run_ui():
             self.mem_auto.set(bool(data.get("mem_auto", False)))
             self.mem_every.set(str(data.get("mem_every", "10")))
             self.mem_last_clean = now_ms()  # 恢复勾选后重新计时，避免启动即清
-            self.ready_var.set(bool(data.get("ready", False)))
-            self.ready_monsters.set(str(data.get("ready_monsters", "1")))
-            self.ready_model.set(str(data.get("ready_model", "0")))
-            self.ready_ai.set(str(data.get("ready_ai", "0")))
-            self.ready_last_room = 0
-            self.ready_last_serial = 0
 
         def save_settings(self):
             path = settings_path()
@@ -1347,11 +1175,7 @@ def run_ui():
                     "move_hold": self.move_hold.get(),
                     "move_release": self.move_release.get(),
                     "mem_auto": self.mem_auto.get(),
-                    "mem_every": self.mem_every.get(),
-                    "ready": self.ready_var.get(),
-                    "ready_monsters": self.ready_monsters.get(),
-                    "ready_model": self.ready_model.get(),
-                    "ready_ai": self.ready_ai.get()}
+                    "mem_every": self.mem_every.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -1417,11 +1241,6 @@ def run_ui():
             self.handle, self.base, self.actor = handle, base, None
             self.pid = pid
             self.auto_fault = False
-            self.ready_last_room = 0
-            self.ready_last_serial = 0
-            self.ready_done = 0
-            self.ready_skipped = 0
-            self.ready_reasons.clear()
             self.status.set(f"已启动{note}。沿用勾选设置，换局自动继续，无需重复连接。")
 
         def stop_clicked(self):
@@ -1448,8 +1267,6 @@ def run_ui():
             self.handle, self.base, self.actor = 0, 0, None
             self.auto_fault = False
             self.disconnect_pending = False
-            self.ready_last_room = 0
-            self.ready_last_serial = 0
             for _enabled, _entry, value in self.rows:
                 value.set("—")
             if not silent:
@@ -1697,59 +1514,8 @@ def run_ui():
             self.kill_status.set("正在执行；上一轮未结束时不重复创建任务。" + kill_hold)
             self.poll_kill()
 
-        # -- 自动准备（移植 team_mod.h sendTeamReady）--
-        def poll_ready(self):
-            if not self.ready_job.busy():
-                return
-            result = self.ready_job.poll(self.handle)
-            if result == -1:
-                return
-            if result == 1:
-                self.ready_done += 1
-                self.ready_status.set(
-                    f"准备包已发送（room={self.ready_last_room}, "
-                    f"serial={self.ready_last_serial}）。成功 {self.ready_done} 次。")
-            else:
-                self.ready_skipped += 1
-                tag = {2: "预检跳过", 4: "原生拒绝", -3: "调用超时"}.get(result, f"异常({result})")
-                self.ready_reasons[tag] = self.ready_reasons.get(tag, 0) + 1
-                self.ready_status.set(f"准备未发送：{tag}。" + round_summary(
-                    self.ready_done, self.ready_skipped, self.ready_reasons, False))
-
-        def start_ready(self):
-            manager = read_u32(self.handle, self.base + MANAGER_PTR)
-            if not manager:
-                return
-            room = read_u32(self.handle, manager + 0x311)
-            serial = read_u32(self.handle, manager + 0x315)
-            if not room or not serial:
-                return
-            # 同一 room/serial 只发一次；换局自动重发
-            if room == self.ready_last_room and serial == self.ready_last_serial:
-                return
-            try:
-                monsters = int(self.ready_monsters.get())
-                model = int(self.ready_model.get())
-                ai = int(self.ready_ai.get())
-            except ValueError:
-                return
-            k = make_ready(self.handle, self.base, monsters, model, ai,
-                           self.ready_reasons)
-            if not k:
-                self.ready_status.set("准备条件未满足：" + round_summary(
-                    0, 0, self.ready_reasons, False))
-                return
-            if not self.ready_job.start(self.handle, k, code_fn=ready_code):
-                self.ready_status.set(
-                    f"准备包发送失败（Win32 错误码 {self.ready_job.start_error}）。")
-                return
-            self.ready_last_room = room
-            self.ready_last_serial = serial
-            self.ready_status.set(f"正在发送准备包（room={room}, serial={serial}）…")
-
         def auto_tick(self):
             self.poll_kill()
-            self.poll_ready()
             # 自杀/秒杀延迟起算点：检测到角色地址（进入战斗）才开始计时；角色消失重新武装
             ready = bool(self.actor)
             self.suicide_armed_at = arm_delay(ready, self.suicide_var.get(),
@@ -1762,9 +1528,6 @@ def run_ui():
                               self.auto_fault or self.disconnect_pending, wanted):
                 self.last_round = now_ms()
                 self.start_kill()
-            # 自动准备：不依赖 actor（大厅也可能有 room/serial），不与秒杀互斥
-            if self.ready_var.get() and not self.ready_job.busy():
-                self.start_ready()
 
         def auto_loop(self):
             # 秒杀独立 30ms 循环（C++ 版为 20ms 定时器），不随属性 tick 变慢
