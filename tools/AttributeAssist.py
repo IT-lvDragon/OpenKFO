@@ -9,6 +9,7 @@
 import ctypes
 import json
 import os
+import random
 import struct
 import sys
 import time
@@ -394,10 +395,7 @@ def arm_delay(actor_ready, active, armed):
     return armed
 
 
-# ---- 自动跑图（键盘模拟：PostMessage 后台按键，不写内存）----
-MOVE_KEYS = {"右(D)": 0x44, "左(A)": 0x41, "上(W)": 0x57, "下(S)": 0x53,
-             "右(→)": 0x27, "左(←)": 0x25, "上(↑)": 0x26, "下(↓)": 0x28}
-WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+# ---- 自动点击（SendInput 前台模拟鼠标，不写内存）----
 _u32 = None
 
 
@@ -406,8 +404,9 @@ def user32():
     global _u32
     if _u32 is None:
         _u32 = ctypes.WinDLL("user32.dll", use_last_error=True)
-        _u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
-                                      wintypes.WPARAM, wintypes.LPARAM]
+        _u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT),
+                                   ctypes.c_int]
+        _u32.SendInput.restype = wintypes.UINT
         _u32.IsWindow.argtypes = [wintypes.HWND]
         _u32.IsWindowVisible.argtypes = [wintypes.HWND]
         _u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
@@ -415,11 +414,15 @@ def user32():
         _u32.EnumWindows.argtypes = [
             ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
             wintypes.LPARAM]
+        _u32.GetForegroundWindow.restype = wintypes.HWND
+        _u32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        _u32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        _u32.GetSystemMetrics.restype = ctypes.c_int
     return _u32
 
 
 def find_main_window(pid):
-    """取该进程第一个可见顶层窗口，作为跑图按键目标。"""
+    """取该进程第一个可见顶层窗口，作为前台判定目标。"""
     if not pid:
         return 0
     lib = user32()
@@ -438,34 +441,10 @@ def find_main_window(pid):
     return found[0] if found else 0
 
 
-def send_move_key(hwnd, vk, down):
-    """SendInput 注入键盘事件——扫描码模式（DirectInput 老游戏只认扫描码）。
-    仅当游戏窗口为前台时由 move_tick 调用；hwnd 供前台比对。"""
-    lib = user32()
-    lib.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
-    lib.SendInput.restype = wintypes.UINT
-    inp = INPUT(type=1)  # INPUT_KEYBOARD
-    inp.union.ki.wScan = kb_scancode(vk)
-    inp.union.ki.dwFlags = kb_flags(vk, down)
-    return lib.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
-
-
 def game_foreground(hwnd):
-    """游戏窗口是否处于前台；跑图按键只在投递给前台。"""
+    """游戏窗口是否处于前台；模拟点击只投递给前台，避免点进别的程序。"""
     lib = user32()
-    lib.GetForegroundWindow.restype = wintypes.HWND
     return bool(hwnd) and lib.GetForegroundWindow() == hwnd
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
-
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
-                ("wParamH", wintypes.WORD)]
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -476,24 +455,64 @@ class MOUSEINPUT(ctypes.Structure):
 
 
 class _INPUTUNION(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+    _fields_ = [("mi", MOUSEINPUT)]
 
 
 class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("union", _INPUTUNION)]
 
 
-KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE = 0x0001, 0x0002, 0x0008
-MAPVK_VK_TO_VSC = 0
-EXTENDED_VKS = {0x25, 0x26, 0x27, 0x28}  # ←↑→↓
+MOUSEEVENTF_MOVE, MOUSEEVENTF_ABSOLUTE = 0x0001, 0x8000
+MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN = 0x0002, 0x0008
 
 
-def kb_scancode(vk):
-    """虚键码 → 扫描码（DirectInput 游戏轮询的是扫描码）。"""
+def mouse_flags(button, down):
+    """鼠标事件标志：按下取 DOWN 值，抬起 = 按下 << 1（LEFTUP=4 / RIGHTUP=0x10）。"""
+    base = MOUSEEVENTF_RIGHTDOWN if button == "右键" else MOUSEEVENTF_LEFTDOWN
+    return base if down else base << 1
+
+
+def abs_coord(x, y, w, h):
+    """屏幕像素 → SendInput 绝对坐标 0..65535（两端对齐，越界截断到屏幕内）。"""
+    x = max(0, min(int(x), int(w) - 1))
+    y = max(0, min(int(y), int(h) - 1))
+    return x * 65535 // (w - 1), y * 65535 // (h - 1)
+
+
+def jitter_point(x, y, radius):
+    """区域内随机取点：半径 0 即精确点；半径 r 时落在以 (x,y) 为中心的方形内。"""
+    if radius <= 0:
+        return x, y
+    return x + random.randint(-radius, radius), y + random.randint(-radius, radius)
+
+
+def send_mouse_click(x, y, button="左键"):
+    """SendInput 前台注入一次鼠标点击：绝对坐标移动、按下、抬起。"""
     lib = user32()
-    lib.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
-    lib.MapVirtualKeyW.restype = wintypes.UINT
-    return lib.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+    w = lib.GetSystemMetrics(0)
+    h = lib.GetSystemMetrics(1)
+    ax, ay = abs_coord(x, y, w, h)
+    move = INPUT(type=0)  # INPUT_MOUSE
+    move.union.mi.dx, move.union.mi.dy = ax, ay
+    move.union.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+    down = INPUT(type=0)
+    down.union.mi.dwFlags = mouse_flags(button, True)
+    up = INPUT(type=0)
+    up.union.mi.dwFlags = mouse_flags(button, False)
+    events = (INPUT * 3)(move, down, up)
+    return lib.SendInput(3, events, ctypes.sizeof(INPUT)) == 3
+
+
+def parse_pixels(text, default=0):
+    """点击随机范围解析：像素；空/非法回退默认；负数归零，上限 2000。"""
+    text = str(text).strip()
+    if not text:
+        return default
+    try:
+        value = int(float(text))
+    except ValueError:
+        return default
+    return max(0, min(value, 2000))
 
 
 _psapi = None
@@ -519,12 +538,6 @@ def parse_minutes(text, default=10):
     except ValueError:
         return default
     return max(1, min(value, 1440))
-
-
-def kb_flags(vk, down):
-    """SendInput 标志（扫描码模式）：8=按扫描码注入，1=扩展键，2=抬起。"""
-    flags = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_VKS else 0)
-    return flags if down else flags | KEYEVENTF_KEYUP
 
 
 def make_kill(handle, base, own, enemy, reasons=None, suicide=False):
@@ -947,16 +960,30 @@ def self_test():
     ok = ok and arm_delay(False, True, 123) == 0
     ok = ok and arm_delay(False, False, 0) == 0
 
-    # 自动跑图：方向键映射完整（WASD + 方向键两套）
-    ok = ok and len(MOVE_KEYS) == 8 and MOVE_KEYS["右(D)"] == 0x44 \
-        and MOVE_KEYS["左(A)"] == 0x41 and MOVE_KEYS["上(W)"] == 0x57 \
-        and MOVE_KEYS["下(S)"] == 0x53 and MOVE_KEYS["右(→)"] == 0x27 \
-        and MOVE_KEYS["左(←)"] == 0x25 and MOVE_KEYS["上(↑)"] == 0x26 \
-        and MOVE_KEYS["下(↓)"] == 0x28
+    # 自动点击：鼠标事件标志（按下取 DOWN，抬起 = 按下 << 1）
+    ok = ok and mouse_flags("左键", True) == 0x0002 \
+        and mouse_flags("左键", False) == 0x0004
+    ok = ok and mouse_flags("右键", True) == 0x0008 \
+        and mouse_flags("右键", False) == 0x0010
+    ok = ok and mouse_flags("中键", True) == 0x0002  # 未知按键回退左键
 
-    # SendInput 标志（扫描码模式）：8=SCANCODE，1=EXTENDEDKEY，2=KEYUP
-    ok = ok and kb_flags(0x44, True) == 8 and kb_flags(0x44, False) == 10
-    ok = ok and kb_flags(0x27, True) == 9 and kb_flags(0x27, False) == 11
+    # 绝对坐标归一化：两端对齐、越界截断
+    ok = ok and abs_coord(0, 0, 1920, 1080) == (0, 0)
+    ok = ok and abs_coord(1919, 1079, 1920, 1080) == (65535, 65535)
+    ok = ok and abs_coord(-5, 2000, 1920, 1080) == (0, 65535)
+    ok = ok and abs_coord(960, 540, 1920, 1080) == (960 * 65535 // 1919,
+                                                    540 * 65535 // 1079)
+
+    # 区域随机取点：半径 0 即精确点；半径 r 时必然落在 [-r, +r] 内
+    ok = ok and jitter_point(100, 200, 0) == (100, 200)
+    for _ in range(50):
+        jx, jy = jitter_point(500, 300, 20)
+        ok = ok and 480 <= jx <= 520 and 280 <= jy <= 320
+
+    # 点击范围解析：空/非法回退 0；负数归零；上限 2000
+    ok = ok and parse_pixels("") == 0 and parse_pixels("abc") == 0
+    ok = ok and parse_pixels("-8") == 0 and parse_pixels("99999") == 2000 \
+        and parse_pixels("15") == 15
 
     # 自动清理间隔解析：空/非法回退 10；下限 1 上限 1440 分钟
     ok = ok and parse_minutes("") == 10 and parse_minutes("abc") == 10
@@ -1081,37 +1108,42 @@ def run_ui():
                       justify="left").grid(row=2, column=0, columnspan=3, sticky="w",
                                            padx=8, pady=(0, 6))
 
-            movebox = ttk.LabelFrame(root, text="自动跑图（后台按键模拟，不写内存）")
-            movebox.pack(fill="x", padx=12, pady=(0, 4))
-            self.move_var = tk.BooleanVar(value=False)
-            self.move_key = tk.StringVar(value="右(D)")
-            self.move_hold = tk.StringVar(value="2")
-            self.move_release = tk.StringVar(value="0.5")
-            self.move_pressed = False
-            self.move_phase_at = 0
-            self.move_hwnd = 0
+            clickbox = ttk.LabelFrame(root, text="自动点击（前台模拟鼠标，不写内存）")
+            clickbox.pack(fill="x", padx=12, pady=(0, 4))
+            self.click_var = tk.BooleanVar(value=False)
+            self.click_interval = tk.StringVar(value="500")
+            self.click_radius = tk.StringVar(value="0")
+            self.click_button = tk.StringVar(value="左键")
+            self.click_x = -1
+            self.click_y = -1
+            self.click_last = 0
+            self.click_count = 0
+            self.click_hwnd = 0
+            self.pick_after_id = 0
             self.pid = 0
-            ttk.Checkbutton(movebox, text="自动跑图（检测到角色后移动）",
-                            variable=self.move_var,
-                            command=self.on_move_toggle).grid(row=0, column=0,
-                                                              sticky="w", padx=8,
-                                                              pady=4)
-            ttk.Label(movebox, text="方向：").grid(row=0, column=1, sticky="e", pady=4)
-            ttk.OptionMenu(movebox, self.move_key, self.move_key.get(),
-                           *MOVE_KEYS).grid(row=0, column=2, sticky="w", pady=4)
-            ttk.Label(movebox, text="按住(秒)：").grid(row=0, column=3, sticky="e",
-                                                       pady=4)
-            ttk.Entry(movebox, textvariable=self.move_hold, width=6).grid(
-                row=0, column=4, sticky="w", pady=4)
-            ttk.Label(movebox, text="松开(秒)：").grid(row=0, column=5, sticky="e",
-                                                       pady=4)
-            ttk.Entry(movebox, textvariable=self.move_release, width=6).grid(
-                row=0, column=6, sticky="w", pady=4)
-            self.move_status = tk.StringVar(
-                value="按住 0 = 一直按住不松；松开 0 = 到点立刻再按。取消勾选立即松键。")
-            ttk.Label(movebox, textvariable=self.move_status, wraplength=520,
-                      justify="left").grid(row=1, column=0, columnspan=7, sticky="w",
-                                           padx=8, pady=(0, 6))
+            ttk.Checkbutton(clickbox, text="自动点击",
+                            variable=self.click_var,
+                            command=self.on_click_toggle).grid(
+                row=0, column=0, sticky="w", padx=8, pady=4)
+            ttk.Button(clickbox, text="拾取位置(3秒)",
+                       command=self.pick_position).grid(row=0, column=1,
+                                                        sticky="w", pady=4)
+            ttk.Label(clickbox, text="间隔(毫秒)：").grid(row=0, column=2,
+                                                         sticky="e", pady=4)
+            ttk.Entry(clickbox, textvariable=self.click_interval, width=7).grid(
+                row=0, column=3, sticky="w", pady=4)
+            ttk.Label(clickbox, text="范围(像素)：").grid(row=0, column=4,
+                                                         sticky="e", pady=4)
+            ttk.Entry(clickbox, textvariable=self.click_radius, width=6).grid(
+                row=0, column=5, sticky="w", pady=4)
+            ttk.OptionMenu(clickbox, self.click_button, self.click_button.get(),
+                           "左键", "右键").grid(row=0, column=6, sticky="w",
+                                               pady=4)
+            self.click_status = tk.StringVar(
+                value="点「拾取位置」后 3 秒内把鼠标移到游戏目标处；范围 >0 时在拾取点附近随机取点。")
+            ttk.Label(clickbox, textvariable=self.click_status, wraplength=520,
+                      justify="left").grid(row=1, column=0, columnspan=7,
+                                           sticky="w", padx=8, pady=(0, 6))
 
             self.status = tk.StringVar(
                 value="游戏运行后选择进程点击“启动”；换局自动继续，取消勾选会恢复原值。")
@@ -1151,10 +1183,13 @@ def run_ui():
             self.suicide_var.set(bool(data.get("suicide", False)))
             self.suicide_delay.set(str(data.get("suicide_delay", "10")))
             self.suicide_armed_at = 0  # 等 actor 检测到后再武装
-            self.move_var.set(bool(data.get("move", False)))
-            self.move_key.set(str(data.get("move_key", "右(D)")))
-            self.move_hold.set(str(data.get("move_hold", "2")))
-            self.move_release.set(str(data.get("move_release", "0.5")))
+            self.click_var.set(bool(data.get("click", False)))
+            self.click_interval.set(str(data.get("click_interval", "500")))
+            self.click_radius.set(str(data.get("click_radius", "0")))
+            self.click_button.set(str(data.get("click_button", "左键")))
+            self.click_x = int(data.get("click_x", -1))
+            self.click_y = int(data.get("click_y", -1))
+            self.click_last = 0  # 恢复勾选后重新计时，避免启动即点
             self.mem_auto.set(bool(data.get("mem_auto", False)))
             self.mem_every.set(str(data.get("mem_every", "10")))
             self.mem_last_clean = now_ms()  # 恢复勾选后重新计时，避免启动即清
@@ -1170,10 +1205,12 @@ def run_ui():
                     "kill_delay": self.kill_delay.get(),
                     "suicide": self.suicide_var.get(),
                     "suicide_delay": self.suicide_delay.get(),
-                    "move": self.move_var.get(),
-                    "move_key": self.move_key.get(),
-                    "move_hold": self.move_hold.get(),
-                    "move_release": self.move_release.get(),
+                    "click": self.click_var.get(),
+                    "click_interval": self.click_interval.get(),
+                    "click_radius": self.click_radius.get(),
+                    "click_button": self.click_button.get(),
+                    "click_x": self.click_x,
+                    "click_y": self.click_y,
                     "mem_auto": self.mem_auto.get(),
                     "mem_every": self.mem_every.get()}
             try:
@@ -1410,52 +1447,63 @@ def run_ui():
             self.suicide_armed_at = 0
             self.save_settings()
 
-        def on_move_toggle(self):
-            # 取消勾选立即松键（move_tick 也会兜底松键，这里保证即时响应）
-            if not self.move_var.get() and self.move_pressed:
-                send_move_key(self.move_hwnd,
-                              MOVE_KEYS.get(self.move_key.get(), 0x44), False)
-                self.move_pressed = False
-                self.move_phase_at = 0
+        def on_click_toggle(self):
+            # 勾选即重新计时，避免上次残留时间点导致启动立即点击
+            self.click_last = now_ms()
             self.save_settings()
 
-        def move_tick(self):
-            """自动跑图状态机：检测到角色、游戏前台才按键；取消/失联/换局立即松键。"""
-            want = self.move_var.get() and self.handle and bool(self.actor)
-            now = now_ms()
-            vk = MOVE_KEYS.get(self.move_key.get(), 0x44)
-            if not want:
-                if self.move_pressed:
-                    send_move_key(self.move_hwnd, vk, False)
-                    self.move_pressed = False
-                    self.move_phase_at = 0
-                if self.move_var.get() and self.handle:
-                    self.move_status.set("已勾选；检测到角色（进战斗）后开始。")
+        def pick_position(self):
+            """3 秒后抓取当前鼠标位置作为点击点；期间把鼠标移到游戏目标处即可。"""
+            if self.pick_after_id:
+                self.root.after_cancel(self.pick_after_id)
+            self.click_status.set("3 秒后拾取鼠标当前位置，请立即把鼠标移到游戏目标点…")
+            self.pick_after_id = self.root.after(3000, self.grab_cursor)
+
+        def grab_cursor(self):
+            self.pick_after_id = 0
+            pt = wintypes.POINT()
+            if not user32().GetCursorPos(ctypes.byref(pt)):
+                self.click_status.set("拾取失败（错误码 %d），请重试。" % ctypes.get_last_error())
                 return
-            if not self.move_hwnd or not user32().IsWindow(self.move_hwnd):
-                self.move_hwnd = find_main_window(self.pid)
-                if not self.move_hwnd:
-                    self.move_status.set("未找到游戏窗口，无法发送按键。")
+            self.click_x, self.click_y = pt.x, pt.y
+            self.click_last = now_ms()
+            self.click_status.set("已拾取 (%d, %d)；勾选自动点击后按间隔在此处点击。" % (pt.x, pt.y))
+            self.save_settings()
+
+        def click_tick(self):
+            """自动点击：仅游戏前台时投递；未拾取坐标/失联即暂停，不做任何注入。"""
+            if not self.click_var.get():
+                return
+            if self.click_x < 0 or self.click_y < 0:
+                self.click_status.set("已勾选；先点「拾取位置」选择点击点。")
+                return
+            if not self.handle:
+                self.click_status.set("未连接游戏，自动点击暂停。")
+                return
+            if not self.click_hwnd or not user32().IsWindow(self.click_hwnd):
+                self.click_hwnd = find_main_window(self.pid)
+                if not self.click_hwnd:
+                    self.click_status.set("未找到游戏窗口，自动点击暂停。")
                     return
-            if not game_foreground(self.move_hwnd):
-                # SendInput 作用于前台窗口：游戏不在前台时不投递，避免按键打进别的程序
-                if self.move_pressed:
-                    send_move_key(self.move_hwnd, vk, False)
-                    self.move_pressed = False
-                    self.move_phase_at = now_ms()
-                self.move_status.set("游戏窗口不在前台，跑图已暂停；切回游戏窗口即自动恢复。")
+            if not game_foreground(self.click_hwnd):
+                # SendInput 作用于前台窗口：游戏不在前台时不投递，避免点击打进别的程序
+                self.click_status.set("游戏窗口不在前台，自动点击已暂停；切回游戏窗口即自动恢复。")
                 return
-            hold = parse_delay_ms(self.move_hold.get())
-            release = parse_delay_ms(self.move_release.get(), 500)
-            if self.move_pressed:
-                if hold and now - self.move_phase_at >= hold:
-                    send_move_key(self.move_hwnd, vk, False)
-                    self.move_pressed = False
-                    self.move_phase_at = now
-            elif not release or now - self.move_phase_at >= release:
-                send_move_key(self.move_hwnd, vk, True)
-                self.move_pressed = True
-                self.move_phase_at = now
+            now = now_ms()
+            interval = parse_delay_ms(self.click_interval.get(), 500)
+            if not interval:
+                interval = 500  # 0/非法回退 500ms，避免死循环式狂点
+            if now - self.click_last < interval:
+                return
+            self.click_last = now
+            radius = parse_pixels(self.click_radius.get())
+            x, y = jitter_point(self.click_x, self.click_y, radius)
+            if send_mouse_click(x, y, self.click_button.get()):
+                self.click_count += 1
+                self.click_status.set("点击中：(点 %d, %d)%s 已点击 %d 次。" % (
+                    x, y, "（范围 %d 随机）" % radius if radius else "", self.click_count))
+            else:
+                self.click_status.set("点击注入失败（错误码 %d）。" % ctypes.get_last_error())
 
         def start_kill(self):
             if self.kill_busy() or self.auto_fault:
@@ -1533,7 +1581,7 @@ def run_ui():
             # 秒杀独立 30ms 循环（C++ 版为 20ms 定时器），不随属性 tick 变慢
             if self.handle:
                 self.auto_tick()
-            self.move_tick()
+            self.click_tick()
             self.mem_tick()
             self.root.after(30, self.auto_loop)
 
@@ -1561,10 +1609,9 @@ def run_ui():
                 psapi().EmptyWorkingSet(self.handle)
 
         def on_close(self):
-            if self.move_pressed:
-                send_move_key(self.move_hwnd,
-                              MOVE_KEYS.get(self.move_key.get(), 0x44), False)
-                self.move_pressed = False
+            if self.pick_after_id:
+                self.root.after_cancel(self.pick_after_id)
+                self.pick_after_id = 0
             self.save_settings()
             if self.handle and not self.stop(silent=True):
                 self.status.set("恢复原值失败，请保持游戏运行后再关闭本窗口重试。")
