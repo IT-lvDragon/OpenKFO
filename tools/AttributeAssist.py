@@ -3,6 +3,7 @@
 移植自 tools/game-mod/main.cpp 与 kill.h：
 - 属性：怒气倍率/无敌/霸体/反伤/防御/吸血，每 100ms 执行勾选项，取消勾选恢复原值。
 - 秒杀：每 400ms 一轮，枚举敌方角色后逐个经一次性远程线程调用原生发包/伤害函数。
+- 结算重放：钩住发包函数抓包（E9 跳板 + 环形槽），改字节后经原生 send 原样重发。
 - 版本校验：已知 gfxz.dat 哈希直接放行；其他客户端（gfld.dat 或更新版）仅警告不拦截，
   秒杀仍受函数序言检查保护（序言不符自动拒绝），属性写入无保护，风险自负。
 """
@@ -384,6 +385,19 @@ def parse_delay_ms(text, default=10000):
     except ValueError:
         return default
     return max(0, min(value * 1000, 3600 * 1000))
+
+
+def parse_ms(text, default, cap=3600 * 1000):
+    """毫秒输入解析（与 parse_delay_ms 的“秒”语义区分）：空回退默认；非法回退默认；
+    负数归零；上限封顶。"""
+    text = str(text).strip()
+    if not text:
+        return default
+    try:
+        value = int(float(text))
+    except ValueError:
+        return default
+    return max(0, min(value, cap))
 
 
 def arm_delay(actor_ready, active, armed):
@@ -842,6 +856,315 @@ class KillJob:
         return result if not self.timed_out else -3
 
 
+# ---- 结算重放：钩住发包函数抓包，改字节后经原生 send 原样重发 ----
+HOOK_CTR_OFF = 0        # 抓包数据块：发包计数器（游戏线程 lock xadd 递增）
+HOOK_MARKER_OFF = 4     # 抓包数据块：重放标记（重放线程置 1，钩子记录进槽）
+HOOK_SLOTS_OFF = 8      # 槽区起点
+HOOK_SLOT_HDR = 12      # 槽头：id(4) + len(4) + marker(4)
+HOOK_SLOT_DATA = 500    # 槽内包体上限
+HOOK_SLOT_SIZE = 512    # 槽总大小 = 头 + 包体
+HOOK_SLOTS = 64         # 环形槽数；两次轮询之间超过 64 包会丢最旧的
+HOOK_READ_BYTES = 16    # 入口序言检查需读取的字节数
+
+_ONE_BYTE_OPS = (set(range(0x40, 0x50)) | set(range(0x50, 0x60)) |
+                 {0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x27, 0x2F, 0x37, 0x3F,
+                  0x60, 0x61, 0x90, 0x98, 0x99, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
+                  0xA4, 0xA5, 0xA6, 0xA7, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+                  0xF5, 0xF8, 0xF9, 0xFC, 0xFD} |
+                 set(range(0x6C, 0x70)) | {0xEC, 0xED, 0xEE, 0xEF})
+_RELATIVE_OPS = (set(range(0x70, 0x80)) | {0xE0, 0xE1, 0xE2, 0xE3, 0xE8, 0xE9, 0xEA,
+                                           0xEB, 0xC3, 0xC2, 0xCB, 0xCC, 0xCD})
+
+
+def _modrm_extra(buf, i):
+    """ModRM 位于 buf[i] 时其后附带字节数（SIB/位移）；越界返回 None。"""
+    if i >= len(buf):
+        return None
+    mod = buf[i] >> 6
+    rm = buf[i] & 7
+    j = i + 1
+    if mod != 3 and rm == 4:
+        if j >= len(buf):
+            return None
+        sib = buf[j]
+        j += 1
+        if mod == 0 and sib & 7 == 5:
+            j += 4                      # SIB base=101 → disp32
+    elif mod == 0 and rm == 5:
+        j += 4                          # disp32 无基址
+    if mod == 1:
+        j += 1
+    elif mod == 2:
+        j += 4
+    return j - i
+
+
+def instr_len32(buf):
+    """估算 32 位代码一条指令的长度（编译器常用输出子集）。
+    遇到相对转移/ret 等搬移后语义会变、或无法识别的指令时返回 None。"""
+    i = 0
+    while i < len(buf) and buf[i] in (0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67,
+                                      0xF0, 0xF2, 0xF3):
+        i += 1
+    if i >= len(buf):
+        return None
+    op = buf[i]
+    i += 1
+    if op == 0x0F:
+        if i >= len(buf):
+            return None
+        op2 = buf[i]
+        i += 1
+        if 0x80 <= op2 <= 0x8F or 0xC8 <= op2 <= 0xCF or \
+                op2 in (0x05, 0x0B, 0x31, 0x34, 0x35, 0x77,
+                        0xA0, 0xA1, 0xA2, 0xA3, 0xA8, 0xA9):
+            return None                 # jcc/loop、syscall/rdtsc/cpuid/emms 等：拒绝
+        extra = _modrm_extra(buf, i)
+        return None if extra is None else i + extra
+    if op in _ONE_BYTE_OPS:
+        return i
+    if op in _RELATIVE_OPS:
+        return None
+    if op == 0x68 or 0xB8 <= op <= 0xBF or op in (0xA1, 0xA3):
+        return i + 4                    # push imm32 / mov r,imm32 / mov acc,moffs
+    if op == 0x6A:
+        return i + 1
+    if op in (0xF6, 0xF7):
+        if i >= len(buf):
+            return None
+        imm = 1 if (buf[i] >> 3) & 7 < 2 else 0     # TEST 组带立即数
+    elif op in (0x81, 0x69, 0xC7):
+        imm = 4
+    elif op in (0x83, 0x6B, 0xC0, 0xC1, 0xC6):
+        imm = 1
+    else:
+        imm = 0
+    extra = _modrm_extra(buf, i)
+    return None if extra is None else i + extra + imm
+
+
+def hook_stolen(raw):
+    """发包函数入口前若干字节 → 可整体搬移的前缀；序言不符/边界不定返回 None。
+    已知序言 55 8B EC 51（push ebp; mov ebp,esp; push ecx），其后那条指令
+    必须能整条搬走，跳回地址才是真实指令边界。"""
+    if not raw or len(raw) < 5 or bytes(raw[:4]) != b"\x55\x8B\xEC\x51":
+        return None
+    n = instr_len32(bytes(raw[4:HOOK_READ_BYTES]))
+    if not n:
+        return None
+    return bytes(raw[:4 + n])
+
+
+def hook_code(code_base, data_base, send_addr, stolen):
+    """抓包钩子：记录 (id, buf, len) 到环形槽，执行被覆盖的原指令后跳回边界。
+    数据块：+0 计数器，+4 重放标记，+8 起 64×512 槽（id/len/marker/包体）。"""
+    c = Code32()
+    c.bytes_((0x9C, 0x60))                          # pushfd/pushad：栈顶+40/44/48 = 前三参数
+    c.bytes_((0x8B, 0x44, 0x24, 0x28))              # mov eax, [esp+40] → id
+    c.bytes_((0x8B, 0x5C, 0x24, 0x2C))              # mov ebx, [esp+44] → buf
+    c.bytes_((0x8B, 0x4C, 0x24, 0x30))              # mov ecx, [esp+48] → len
+    c.bytes_((0x81, 0xF9))                          # cmp ecx, HOOK_SLOT_DATA
+    c.word(HOOK_SLOT_DATA)
+    c.bytes_((0x76, 0x05))                          # jbe +5（跳过下面 5 字节赋值）
+    c.bytes_((0xB9,))                               # mov ecx, HOOK_SLOT_DATA
+    c.word(HOOK_SLOT_DATA)
+    c.bytes_((0xBA, 0x01, 0x00, 0x00, 0x00))        # mov edx, 1
+    c.bytes_((0xF0, 0x0F, 0xC1, 0x15))              # lock xadd [计数器], edx → edx=旧值
+    c.word(data_base + HOOK_CTR_OFF)
+    c.bytes_((0x83, 0xE2, 0x3F))                    # and edx, 63
+    c.bytes_((0xC1, 0xE2, 0x09))                    # shl edx, 9（×512）
+    c.bytes_((0x8D, 0x92))                          # lea edx, [edx+槽区]
+    c.word(data_base + HOOK_SLOTS_OFF)
+    c.bytes_((0x89, 0x02))                          # mov [edx], eax → id
+    c.bytes_((0x89, 0x4A, 0x04))                    # mov [edx+4], ecx → len
+    c.bytes_((0x8B, 0x05))                          # mov eax, [重放标记]
+    c.word(data_base + HOOK_MARKER_OFF)
+    c.bytes_((0x89, 0x42, 0x08))                    # mov [edx+8], eax → marker
+    c.bytes_((0xFC,))                               # cld
+    c.bytes_((0x8D, 0x7A, 0x0C))                    # lea edi, [edx+12]
+    c.bytes_((0x8B, 0xF3))                          # mov esi, ebx
+    c.bytes_((0xF3, 0xA4))                          # rep movsb
+    c.bytes_((0x9D, 0x61))                          # popfd/popad
+    c.bytes_(tuple(stolen))                         # 被覆盖的原指令
+    c.bytes_((0xE9,))                               # jmp send+len(stolen)
+    p = c.hole()
+    c.rel(p, send_addr + len(stolen) - code_base)   # rel32 相对下一条指令，需扣除加载基址
+    return bytes(c.b)
+
+
+def send_packet_code(code_base, data_base, send_addr, packet_id, payload, marker_addr):
+    """远程线程：置重放标记 → send(id, buf, len, 0, 0) → 清标记 → 写状态。
+    data_base+0 为包体，+128 为状态：1 成功 / 2 SEH 捕获异常。marker_addr=0 不写标记。"""
+    c = Code32()
+    status = data_base + 128
+    c.bytes_((0x55, 0x8B, 0xEC, 0x60, 0x83, 0xEC, 0x08))   # 帧 + pushad + SEH 节点
+    c.bytes_((0xC7, 0x44, 0x24, 0x04))
+    handler = c.hole()
+    c.bytes_((0x64, 0xA1, 0, 0, 0, 0, 0x89, 0x04, 0x24, 0x64, 0x89, 0x25, 0, 0, 0, 0))
+    if marker_addr:
+        c.bytes_((0xC7, 0x05))
+        c.word(marker_addr)
+        c.word(1)
+    c.push(0)
+    c.push(0)
+    c.push(len(payload))
+    c.push(data_base)
+    c.push(packet_id)
+    c.call(send_addr)
+    c.bytes_((0x83, 0xC4, 0x14))
+    if marker_addr:
+        c.bytes_((0xC7, 0x05))
+        c.word(marker_addr)
+        c.word(0)
+    c.bytes_((0xC7, 0x05))                          # 状态 = 1（成功）
+    c.word(status)
+    c.word(1)
+    c.bytes_((0xEB, 0x00))                          # jmp short cleanup
+    over = len(c.b) - 1
+    fault = len(c.b)
+    if marker_addr:
+        c.bytes_((0xC7, 0x05))                      # 异常路径也要清标记
+        c.word(marker_addr)
+        c.word(0)
+    c.bytes_((0xC7, 0x05))                          # 状态 = 2（SEH 捕获）
+    c.word(status)
+    c.word(2)
+    cleanup = len(c.b)
+    c.b[over] = (cleanup - over - 1) & 0xFF
+    c.bytes_((0x8B, 0x04, 0x24, 0x64, 0xA3, 0, 0, 0, 0, 0x83, 0xC4, 0x08, 0x61, 0x33,
+              0xC0, 0x8B, 0xE5, 0x5D, 0xC2, 0x04, 0x00))
+    c.patch(handler, code_base + len(c.b))
+    # SEH 处理器：恢复到 fault 处带 SEH 节点的栈位置继续执行（kill_code 同款）
+    c.bytes_((0x8B, 0x44, 0x24, 0x0C, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x90))
+    c.word(0xC4)
+    c.bytes_((0xC7, 0x80))
+    c.word(0xB8)
+    c.word(code_base + fault)
+    c.bytes_((0x33, 0xC0, 0xC3))
+    return bytes(c.b)
+
+
+class PacketJob:
+    """一次性远程线程重放数据包，结束后回收内存；5 秒未完成强杀线程回收资源。"""
+
+    TIMEOUT_SECONDS = 5.0
+
+    def __init__(self):
+        self.thread = 0
+        self.block = 0
+        self.started = 0.0
+        self.start_error = 0
+        self.timed_out = False
+
+    def busy(self):
+        return bool(self.thread)
+
+    def start(self, handle, send_addr, packet_id, payload, marker_addr=0):
+        if self.thread:
+            return False
+        self.start_error = 0
+        block = k32.VirtualAllocEx(handle, None, 8192, MEM_COMMIT_RESERVE, PAGE_READWRITE) or 0
+        if not block:
+            self.start_error = ctypes.get_last_error()
+            return False
+        code = send_packet_code(block, block + 4096, send_addr, packet_id,
+                                 payload, marker_addr)
+        got = ctypes.c_size_t(0)
+        ok = len(code) <= 4096
+        if ok:
+            ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block), code,
+                                             len(code), ctypes.byref(got))) \
+                and got.value == len(code)
+        if ok:
+            ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block + 4096),
+                                             payload, len(payload),
+                                             ctypes.byref(got))) and got.value == len(payload)
+        if ok:
+            previous = wintypes.DWORD(0)
+            ok = bool(k32.VirtualProtectEx(handle, ctypes.c_void_p(block), 4096,
+                                           PAGE_EXECUTE_READ, ctypes.byref(previous)))
+            k32.FlushInstructionCache(handle, ctypes.c_void_p(block), len(code))
+        thread = 0
+        if ok:
+            thread = k32.CreateRemoteThread(handle, None, 0, ctypes.c_void_p(block),
+                                            None, 0, None) or 0
+            if not thread:
+                self.start_error = ctypes.get_last_error()
+        if not thread:
+            k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+            return False
+        self.thread, self.block, self.started = thread, block, time.monotonic()
+        return True
+
+    def poll(self, handle):
+        if not self.thread:
+            return -2
+        self.timed_out = False
+        if k32.WaitForSingleObject(self.thread, 0) != WAIT_OBJECT_0:
+            if time.monotonic() - self.started < self.TIMEOUT_SECONDS:
+                return -1
+            self.timed_out = True
+            k32.TerminateThread(self.thread, 0)
+        result = read_u32(handle, self.block + 4096 + 128) or 0
+        k32.CloseHandle(self.thread)
+        self.thread = 0
+        k32.VirtualFreeEx(handle, ctypes.c_void_p(self.block), 0, MEM_RELEASE)
+        self.block = 0
+        return result if not self.timed_out else -3
+
+
+def parse_hex(text):
+    """hex 文本 → bytes；支持空格/逗号/换行分隔；空或非法返回 None。"""
+    clean = "".join(str(text).split()).replace(",", "")
+    if not clean or len(clean) % 2:
+        return None
+    try:
+        return bytes.fromhex(clean)
+    except ValueError:
+        return None
+
+
+def patch_hex(payload, find, replace):
+    """把 payload 中所有 find 字节序列替换为 replace；find 为空返回 None。"""
+    if not find or not payload:
+        return None
+    return payload.replace(find, replace)
+
+
+def parse_filter_ids(text):
+    """过滤条件：十进制或 0x 十六进制 ID 集合；无法解析的片段忽略。"""
+    ids = set()
+    for token in str(text).replace("，", ",").replace(" ", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            ids.add(int(token, 0))
+        except ValueError:
+            try:
+                ids.add(int(token, 10))
+            except ValueError:
+                pass
+    return ids
+
+
+def parse_capture_slot(blob):
+    """512 字节槽 → 记录；len 超上限按上限截断（写入端已截断，双保险）。"""
+    packet_id, n, marker = struct.unpack_from("<III", blob, 0)
+    n = min(n, HOOK_SLOT_DATA)
+    return {"id": packet_id, "mine": bool(marker),
+            "data": bytes(blob[HOOK_SLOT_HDR:HOOK_SLOT_HDR + n])}
+
+
+def packet_line(seq, rec):
+    """列表行文本：序号 时间 id 长度 来源 前八字节预览。"""
+    data = rec["data"]
+    return "#%-4d %s id=%-6d len=%-4d [%s] %s%s" % (
+        seq, rec.get("time", ""), rec["id"], len(data),
+        "我发" if rec.get("mine") else "游戏",
+        data[:8].hex(" ").upper(), "…" if len(data) > 8 else "")
+
+
 # ---- 自检：本进程合成内存，不注入任何代码 ----
 def self_test():
     handle = k32.GetCurrentProcess() or 0
@@ -1034,6 +1357,82 @@ def self_test():
     ok = ok and parse_minutes("") == 10 and parse_minutes("abc") == 10
     ok = ok and parse_minutes("0") == 1 and parse_minutes("99999") == 1440 \
         and parse_minutes("5") == 5
+
+    # ---- 结算重放：指令长度估算（覆盖跳回边界的关键路径）----
+    ok = ok and instr_len32(b"\x53") == 1                          # push ebx
+    ok = ok and instr_len32(bytes.fromhex("8B4508")) == 3          # mov eax,[ebp+8]
+    ok = ok and instr_len32(bytes.fromhex("81EC40010000")) == 6    # sub esp,140h
+    ok = ok and instr_len32(bytes.fromhex("894DFC")) == 3          # mov [ebp-4],ecx
+    ok = ok and instr_len32(bytes.fromhex("8B855C010000")) == 6    # mov eax,[ebp+15Ch]
+    ok = ok and instr_len32(bytes.fromhex("8B04BD78563412")) == 7  # mov eax,[sib+disp32]
+    ok = ok and instr_len32(bytes.fromhex("B878563412")) == 5      # mov eax,imm32
+    ok = ok and instr_len32(bytes.fromhex("6810270000")) == 5      # push 2710h
+    ok = ok and instr_len32(bytes.fromhex("83C408")) == 3          # add esp,8
+    ok = ok and instr_len32(bytes.fromhex("F00FC11578563412")) == 8  # lock xadd [mem],edx
+    ok = ok and instr_len32(bytes.fromhex("0F8F78563412")) is None  # jg rel32 拒绝
+    ok = ok and instr_len32(bytes.fromhex("E800000000")) is None    # call rel32 拒绝
+    ok = ok and instr_len32(b"\xC3") is None                        # ret 拒绝
+
+    # 抓包入口搬移判定：序言 + 整条指令边界
+    ok = ok and hook_stolen(bytes.fromhex("558BEC5153")) == bytes.fromhex("558BEC5153")
+    ok = ok and hook_stolen(bytes.fromhex("558BEC518B4508C3")) == bytes.fromhex("558BEC518B4508")
+    ok = ok and hook_stolen(bytes.fromhex("558BEC51E9")) is None
+    ok = ok and hook_stolen(bytes.fromhex("558BEC51C3")) is None
+    ok = ok and hook_stolen(bytes.fromhex("558BEC51")) is None      # 字节不足
+    ok = ok and hook_stolen(bytes.fromhex("8B455C5356")) is None    # 序言不符
+
+    # 钩子代码：结构 + 跳回边界校验
+    send_addr = 0x40000000 + 0x63FBB0
+    stolen = bytes.fromhex("558BEC5153")
+    hcode = hook_code(0x10000000, 0x10001000, send_addr, stolen)
+    ok = ok and len(hcode) <= 4096 and hcode[0] == 0x9C and hcode[1] == 0x60
+    ok = ok and b"\xF0\x0F\xC1\x15" + struct.pack("<I", 0x10001000) in hcode
+    ok = ok and struct.pack("<I", 0x10001000 + HOOK_MARKER_OFF) in hcode
+    ok = ok and struct.pack("<I", 0x10001000 + HOOK_SLOTS_OFF) in hcode
+    ok = ok and hcode[len(hcode) - len(stolen) - 5:len(hcode) - 5] == stolen
+    ok = ok and hcode[-5] == 0xE9
+    rel = struct.unpack_from("<I", hcode, len(hcode) - 4)[0]
+    ok = ok and 0x10000000 + len(hcode) + rel == send_addr + len(stolen)
+
+    # 重放代码：参数压栈顺序、状态写回、marker 可选
+    payload = bytes(range(10))
+    scode = send_packet_code(0x20000000, 0x20001000, 0x40000000 + 0x63FBB0, 8121,
+                             payload, 0x20001000 + HOOK_MARKER_OFF)
+    ok = ok and len(scode) <= 4096 and scode.rfind(b"\xC2\x04\x00") != -1 \
+        and scode.rfind(b"\xC3") > scode.rfind(b"\xC2\x04\x00")   # 末尾是 SEH 处理器的 ret
+    ok = ok and b"\x68" + struct.pack("<I", 8121) in scode
+    ok = ok and b"\x68" + struct.pack("<I", 0x20001000) in scode
+    ok = ok and b"\x68" + struct.pack("<I", len(payload)) in scode
+    ok = ok and struct.pack("<I", 0x40000000 + 0x63FBB0) in scode
+    ok = ok and struct.pack("<I", 0x20001000 + HOOK_MARKER_OFF) in scode
+    ok = ok and struct.pack("<I", 0x20001000 + 128) in scode
+    plain = send_packet_code(0x20000000, 0x20001000, 0x40000000, 8121, payload, 0)
+    ok = ok and struct.pack("<I", 0x20001000 + HOOK_MARKER_OFF) not in plain
+
+    # hex 工具与过滤、槽解析
+    ok = ok and parse_hex("55 8b ec") == b"\x55\x8b\xec"
+    ok = ok and parse_hex("55,8B\nEC") == bytes([0x55, 0x8B, 0xEC])
+    ok = ok and parse_hex("5") is None and parse_hex("GG") is None and parse_hex("") is None
+    body = bytes(range(20))
+    ok = ok and patch_hex(body, bytes([3, 4]), bytes([9, 9])) == body[:3] + b"\x09\x09" + body[5:]
+    ok = ok and patch_hex(body, b"\xFF", b"\x01") == body
+    ok = ok and patch_hex(body, b"", b"\x01") is None
+    ok = ok and parse_filter_ids("8121, 0x1FB9 abc") == {8121}      # 0x1FB9=8121 去重
+    ok = ok and parse_filter_ids("21900 08121") == {21900, 8121}    # 前导零按十进制
+    slot = bytearray(HOOK_SLOT_SIZE)
+    struct.pack_into("<III", slot, 0, 8121, 3, 1)
+    slot[HOOK_SLOT_HDR:HOOK_SLOT_HDR + 3] = b"\xAA\xBB\xCC"
+    parsed = parse_capture_slot(bytes(slot))
+    ok = ok and parsed["id"] == 8121 and parsed["mine"] and parsed["data"] == b"\xAA\xBB\xCC"
+    empty = parse_capture_slot(bytes(HOOK_SLOT_SIZE))
+    ok = ok and empty["data"] == b"" and not empty["mine"]
+    ok = ok and packet_line(3, {"time": "12:00:00", "id": 8121, "mine": True,
+                                "data": b"\x55\x8B\xEC"}).startswith("#3")
+
+    # 毫秒解析（自动点击/重放循环间隔）：与秒制的 parse_delay_ms 区分
+    ok = ok and parse_ms("500", 500) == 500 and parse_ms("", 500) == 500
+    ok = ok and parse_ms("0", 500) == 0 and parse_ms("-3", 500) == 0
+    ok = ok and parse_ms("abc", 500) == 500 and parse_ms("99999999", 500) == 3600000
 
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
@@ -1249,6 +1648,73 @@ def run_ui():
                       justify="left").grid(row=1, column=0, columnspan=7,
                                            sticky="w", padx=8, pady=(0, 6))
 
+            replaybox = ttk.LabelFrame(root, text="结算重放（抓包 → 改字节 → 原生重发；风险自负）")
+            replaybox.pack(fill="x", padx=12, pady=(0, 4))
+            self.capture_var = tk.BooleanVar(value=False)
+            self.capture_filter = tk.StringVar(value="")
+            self.capture_block = 0
+            self.capture_orig = b""
+            self.capture_seen = 0
+            self.packets = []
+            self.view = []               # 列表当前显示（过滤后）的记录
+            self.send_job = PacketJob()
+            self.loop_var = tk.BooleanVar(value=False)
+            self.loop_interval = tk.StringVar(value="1000")
+            self.loop_count = tk.StringVar(value="0")
+            self.loop_left = 0
+            self.loop_last = 0
+            self.replay_sent = 0
+            crow = ttk.Frame(replaybox)
+            crow.pack(fill="x", padx=8, pady=(4, 2))
+            ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
+                            command=self.on_capture_toggle).pack(side="left")
+            ttk.Label(crow, text="只显示ID:").pack(side="left", padx=(10, 2))
+            ttk.Entry(crow, textvariable=self.capture_filter, width=11).pack(side="left")
+            ttk.Button(crow, text="清空记录",
+                       command=self.clear_packets).pack(side="left", padx=(10, 0))
+            ttk.Button(crow, text="保存记录",
+                       command=self.save_packets).pack(side="left", padx=(4, 0))
+            ttk.Button(crow, text="载入记录",
+                       command=self.load_packets).pack(side="left", padx=(4, 0))
+            lrow = ttk.Frame(replaybox)
+            lrow.pack(fill="x", padx=8, pady=2)
+            self.packet_list = tk.Listbox(lrow, height=6, width=92, font="TkFixedFont")
+            pscroll = ttk.Scrollbar(lrow, command=self.packet_list.yview)
+            self.packet_list.configure(yscrollcommand=pscroll.set)
+            self.packet_list.pack(side="left")
+            pscroll.pack(side="left", fill="y")
+            erow = ttk.Frame(replaybox)
+            erow.pack(fill="x", padx=8, pady=2)
+            ttk.Button(erow, text="选中→编辑",
+                       command=self.load_selected_packet).pack(side="left")
+            ttk.Label(erow, text="ID:").pack(side="left", padx=(10, 2))
+            self.replay_id = tk.StringVar(value="8121")
+            ttk.Entry(erow, textvariable=self.replay_id, width=8).pack(side="left")
+            ttk.Label(erow, text="查找(hex):").pack(side="left", padx=(10, 2))
+            self.hex_find = tk.StringVar(value="")
+            ttk.Entry(erow, textvariable=self.hex_find, width=13).pack(side="left")
+            ttk.Label(erow, text="替换为:").pack(side="left", padx=(6, 2))
+            self.hex_replace = tk.StringVar(value="")
+            ttk.Entry(erow, textvariable=self.hex_replace, width=13).pack(side="left")
+            ttk.Button(erow, text="应用替换",
+                       command=self.apply_hex_patch).pack(side="left", padx=(8, 0))
+            self.hex_box = tk.Text(replaybox, height=4, wrap="char", font="TkFixedFont")
+            self.hex_box.pack(fill="x", padx=8, pady=2)
+            srow = ttk.Frame(replaybox)
+            srow.pack(fill="x", padx=8, pady=(0, 2))
+            ttk.Button(srow, text="发送一次", command=self.send_once).pack(side="left")
+            ttk.Checkbutton(srow, text="循环", variable=self.loop_var,
+                            command=self.on_loop_toggle).pack(side="left", padx=(10, 0))
+            ttk.Label(srow, text="间隔(ms):").pack(side="left", padx=(8, 2))
+            ttk.Entry(srow, textvariable=self.loop_interval, width=7).pack(side="left")
+            ttk.Label(srow, text="次数(0=无限):").pack(side="left", padx=(8, 2))
+            ttk.Entry(srow, textvariable=self.loop_count, width=6).pack(side="left")
+            self.replay_status = tk.StringVar(
+                value="先开抓包完整打一局真实结算；在列表选中结算包载入编辑区，改字节后重放。")
+            ttk.Label(replaybox, textvariable=self.replay_status, wraplength=620,
+                      justify="left").pack(fill="x", padx=8, pady=(0, 6))
+            self.capture_filter.trace_add("write", lambda *_: self.refresh_packet_list())
+
             self.status = tk.StringVar(
                 value="游戏运行后选择进程点击“启动”；换局自动继续，取消勾选会恢复原值。")
             ttk.Label(root, textvariable=self.status, wraplength=520,
@@ -1304,6 +1770,11 @@ def run_ui():
             self.mem_auto.set(bool(data.get("mem_auto", False)))
             self.mem_every.set(str(data.get("mem_every", "10")))
             self.mem_last_clean = now_ms()  # 恢复勾选后重新计时，避免启动即清
+            self.capture_var.set(bool(data.get("capture", False)))
+            self.capture_filter.set(str(data.get("capture_filter", "")))
+            self.loop_interval.set(str(data.get("loop_interval", "1000")))
+            self.loop_count.set(str(data.get("loop_count", "0")))
+            self.replay_id.set(str(data.get("replay_id", "8121")))
 
         def save_settings(self):
             path = settings_path()
@@ -1327,7 +1798,12 @@ def run_ui():
                     "click_x": self.click_x,
                     "click_y": self.click_y,
                     "mem_auto": self.mem_auto.get(),
-                    "mem_every": self.mem_every.get()}
+                    "mem_every": self.mem_every.get(),
+                    "capture": self.capture_var.get(),
+                    "capture_filter": self.capture_filter.get(),
+                    "loop_interval": self.loop_interval.get(),
+                    "loop_count": self.loop_count.get(),
+                    "replay_id": self.replay_id.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -1404,11 +1880,12 @@ def run_ui():
                     self.status.set("尚未连接游戏进程。")
                 return True
             self.kill_cancel = True
-            if self.kill_busy():
+            self.stop_capture()
+            if self.kill_busy() or self.send_job.busy():
                 # 不强杀线程：等当前原生调用返回后再断开（kill.h 同款语义）
                 self.disconnect_pending = True
                 if not silent:
-                    self.status.set("等待秒杀调用结束后断开；勾选已保留。")
+                    self.status.set("等待自动调用结束后断开；勾选已保留。")
                 return False
             if k32.WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0:
                 self.actor = None  # 游戏已退出，原值无法也无需恢复
@@ -1438,7 +1915,8 @@ def run_ui():
                 if k32.WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0:
                     self.actor = None  # 游戏已退出：不回写旧内存
                     self.disconnect_pending = True
-                elif self.disconnect_pending and not self.kill_busy():
+                elif self.disconnect_pending and not self.kill_busy() \
+                        and not self.send_job.busy():
                     self.disconnect_pending = False
                     if self.stop(silent=True):
                         self.status.set("游戏已退出，已停止所有操作；勾选保留。")
@@ -1652,7 +2130,7 @@ def run_ui():
                 self.click_status.set("游戏窗口不在前台，自动点击已暂停；切回游戏窗口即自动恢复。")
                 return
             now = now_ms()
-            interval = parse_delay_ms(self.click_interval.get(), 500)
+            interval = parse_ms(self.click_interval.get(), 500)
             if not interval:
                 interval = 500  # 0/非法回退 500ms，避免死循环式狂点
             if now - self.click_last < interval:
@@ -1666,6 +2144,278 @@ def run_ui():
                     x, y, "（范围 %d 随机）" % radius if radius else "", self.click_count))
             else:
                 self.click_status.set("点击注入失败（错误码 %d）。" % ctypes.get_last_error())
+
+        # -- 结算重放：抓包 + 改字节 + 原生重发 --
+        def on_capture_toggle(self):
+            if self.capture_var.get() and not self.handle:
+                self.replay_status.set("已勾选抓包；连接游戏进程后自动安装钩子。")
+            self.save_settings()
+
+        def on_loop_toggle(self):
+            if self.loop_var.get():
+                count = parse_ms(self.loop_count.get(), 0)
+                self.loop_left = -1 if count == 0 else count  # -1 = 无限
+                self.loop_last = 0
+                self.replay_sent = 0
+                self.replay_status.set("循环重放已就绪；发送失败或异常会自动停止。")
+            self.save_settings()
+
+        def start_capture(self):
+            """发包函数入口写 E9 跳板：记录参数到环形槽后执行原指令并跳回边界。"""
+            def fail(msg):
+                self.capture_var.set(False)
+                self.replay_status.set(msg)
+
+            send_addr = self.base + KILL_SEND_OFF
+            if read_u32(self.handle, send_addr) != 0x51EC8B55:
+                return fail("抓包失败：发包函数序言不符（未知客户端），已自动取消勾选。")
+            raw = read_mem(self.handle, send_addr, HOOK_READ_BYTES)
+            stolen = hook_stolen(raw) if raw else None
+            if not stolen:
+                return fail("抓包失败：发包函数入口指令无法安全搬移，已自动取消勾选。")
+            block = k32.VirtualAllocEx(self.handle, None, 0xA000, MEM_COMMIT_RESERVE,
+                                       PAGE_READWRITE) or 0
+            if not block:
+                return fail("抓包失败：远程内存分配失败（错误码 %d）。" % ctypes.get_last_error())
+            code = hook_code(block, block + 0x1000, send_addr, stolen)
+            got = ctypes.c_size_t(0)
+            ok = bool(k32.WriteProcessMemory(self.handle, ctypes.c_void_p(block), code,
+                                             len(code), ctypes.byref(got))) \
+                and got.value == len(code)
+            if ok:
+                previous = wintypes.DWORD(0)
+                ok = bool(k32.VirtualProtectEx(self.handle, ctypes.c_void_p(block), 4096,
+                                               PAGE_EXECUTE_READ, ctypes.byref(previous)))
+                k32.FlushInstructionCache(self.handle, ctypes.c_void_p(block), len(code))
+            if ok:
+                jump = b"\xE9" + struct.pack("<I", (block - (send_addr + 5)) & 0xFFFFFFFF)
+                ok = bool(k32.WriteProcessMemory(self.handle, ctypes.c_void_p(send_addr),
+                                                 jump, 5, ctypes.byref(got))) and got.value == 5
+                k32.FlushInstructionCache(self.handle, ctypes.c_void_p(send_addr), 5)
+            if not ok:
+                k32.VirtualFreeEx(self.handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+                return fail("抓包失败：钩子写入失败（错误码 %d），已自动取消勾选。"
+                            % ctypes.get_last_error())
+            self.capture_block, self.capture_orig, self.capture_seen = block, stolen, 0
+            self.replay_status.set("抓包已开启（%d 槽 × %d 字节）。之后本机发出的数据包都会进入列表。"
+                                   % (HOOK_SLOTS, HOOK_SLOT_DATA))
+
+        def stop_capture(self):
+            if not self.capture_block:
+                return
+            block, orig = self.capture_block, self.capture_orig
+            self.capture_block, self.capture_orig, self.capture_seen = 0, b"", 0
+            if not self.handle or not orig:
+                return
+            if k32.WaitForSingleObject(self.handle, 0) != WAIT_TIMEOUT:
+                return                      # 游戏已退出，钩子随进程消失
+            send_addr = self.base + KILL_SEND_OFF
+            jump = b"\xE9" + struct.pack("<I", (block - (send_addr + 5)) & 0xFFFFFFFF)
+            if read_mem(self.handle, send_addr, 5) != jump:
+                self.replay_status.set("发包函数入口与安装时不一致，钩子保留未卸载。")
+                return
+            got = ctypes.c_size_t(0)
+            if k32.WriteProcessMemory(self.handle, ctypes.c_void_p(send_addr), orig,
+                                      len(orig), ctypes.byref(got)):
+                k32.FlushInstructionCache(self.handle, ctypes.c_void_p(send_addr), len(orig))
+            k32.VirtualFreeEx(self.handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+            self.replay_status.set("抓包已关闭。")
+
+        def capture_tick(self):
+            if not self.capture_var.get():
+                self.stop_capture()
+                return
+            if not self.handle:
+                return
+            if not self.capture_block:
+                self.start_capture()
+                return
+            counter = read_u32(self.handle, self.capture_block + 0x1000 + HOOK_CTR_OFF)
+            if counter is None:
+                return
+            if counter - self.capture_seen > HOOK_SLOTS:
+                self.capture_seen = counter - HOOK_SLOTS
+            fresh = []
+            for v in range(max(self.capture_seen, 0), counter):
+                slot = self.capture_block + 0x1000 + HOOK_SLOTS_OFF + (v & 63) * HOOK_SLOT_SIZE
+                blob = read_mem(self.handle, slot, HOOK_SLOT_SIZE)
+                if not blob:
+                    continue
+                rec = parse_capture_slot(blob)
+                if rec["data"]:
+                    rec["time"] = time.strftime("%H:%M:%S")
+                    fresh.append(rec)
+            self.capture_seen = max(self.capture_seen, counter)
+            if fresh:
+                self.packets.extend(fresh)
+                if len(self.packets) > 400:
+                    del self.packets[:len(self.packets) - 400]
+                self.refresh_packet_list()
+
+        def refresh_packet_list(self):
+            self.packet_list.delete(0, "end")
+            self.view = []
+            ids = parse_filter_ids(self.capture_filter.get())
+            for seq, rec in enumerate(self.packets, 1):
+                if ids and rec["id"] not in ids:
+                    continue
+                self.packet_list.insert("end", packet_line(seq, rec))
+                self.view.append(rec)
+
+        def clear_packets(self):
+            self.packets = []
+            self.refresh_packet_list()
+
+        def save_packets(self):
+            if not self.packets:
+                self.replay_status.set("没有可保存的记录。")
+                return
+            import tkinter.filedialog as fd
+            path = fd.asksaveasfilename(defaultextension=".json",
+                                        initialfile="packets.json",
+                                        filetypes=[("JSON", "*.json")])
+            if not path:
+                return
+            dump = {"packets": [{"time": r["time"], "id": r["id"],
+                                 "hex": r["data"].hex()} for r in self.packets]}
+            try:
+                with open(path, "w", encoding="utf-8") as fp:
+                    json.dump(dump, fp, ensure_ascii=False, indent=1)
+            except OSError as exc:
+                self.replay_status.set("保存失败：%s" % exc)
+                return
+            self.replay_status.set("已保存 %d 条记录到 %s。" % (len(self.packets), path))
+
+        def load_packets(self):
+            import tkinter.filedialog as fd
+            path = fd.askopenfilename(filetypes=[("JSON", "*.json")])
+            if not path:
+                return
+            try:
+                with open(path, encoding="utf-8") as fp:
+                    items = json.load(fp).get("packets", [])
+            except (OSError, ValueError, AttributeError):
+                self.replay_status.set("载入失败：文件格式不正确。")
+                return
+            records = []
+            for item in items[:400]:
+                try:
+                    data = parse_hex(str(item["hex"]))
+                    if data:
+                        records.append({"time": str(item.get("time", "")),
+                                        "id": int(item["id"]), "mine": False, "data": data})
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self.packets = records
+            self.refresh_packet_list()
+            self.replay_status.set("已载入 %d 条记录。" % len(records))
+
+        def load_selected_packet(self):
+            sel = self.packet_list.curselection()
+            if not sel:
+                self.replay_status.set("先在列表中选中一条记录。")
+                return
+            rec = self.view[sel[0]]
+            self.replay_id.set(str(rec["id"]))
+            self.hex_box.delete("1.0", "end")
+            self.hex_box.insert("1.0", rec["data"].hex(" ").upper())
+            self.replay_status.set("已载入 id=%d、%d 字节到编辑区；改完字节即可发送。"
+                                   % (rec["id"], len(rec["data"])))
+
+        def apply_hex_patch(self):
+            parsed = self.payload_from_box()
+            find = parse_hex(self.hex_find.get())
+            replace = parse_hex(self.hex_replace.get())
+            if parsed is None or find is None or not find or replace is None:
+                self.replay_status.set("替换失败：包体或查找/替换 hex 非法。")
+                return
+            payload = parsed[1]
+            count = payload.count(find)
+            if not count:
+                self.replay_status.set("包体中未找到查找内容。")
+                return
+            patched = patch_hex(payload, find, replace)
+            self.hex_box.delete("1.0", "end")
+            self.hex_box.insert("1.0", patched.hex(" ").upper())
+            self.replay_status.set("已替换 %d 处，当前 %d 字节。" % (count, len(patched)))
+
+        def payload_from_box(self):
+            """编辑区内容 → (id, bytes)；非法时在状态栏提示并返回 None。"""
+            payload = parse_hex(self.hex_box.get("1.0", "end"))
+            if payload is None or not payload:
+                self.replay_status.set("包体为空或 hex 非法（成对十六进制，如 55 8B EC）。")
+                return None
+            if len(payload) > HOOK_SLOT_DATA:
+                self.replay_status.set("包体超长：最多 %d 字节，当前 %d。"
+                                       % (HOOK_SLOT_DATA, len(payload)))
+                return None
+            try:
+                packet_id = int(self.replay_id.get().strip(), 0)
+            except ValueError:
+                self.replay_status.set("数据包 ID 非法（十进制或 0x 十六进制）。")
+                return None
+            return packet_id, payload
+
+        def start_send(self, parsed):
+            packet_id, payload = parsed
+            marker = self.capture_block + 0x1000 + HOOK_MARKER_OFF \
+                if self.capture_block else 0
+            if self.send_job.start(self.handle, self.base + KILL_SEND_OFF, packet_id,
+                                   payload, marker):
+                return True
+            self.replay_status.set("发送失败：远程线程创建失败（Win32 错误码 %d）。"
+                                   % self.send_job.start_error)
+            return False
+
+        def send_once(self):
+            if not self.handle:
+                self.replay_status.set("请先选择进程并点「启动」。")
+                return
+            if self.send_job.busy():
+                self.replay_status.set("上一次发送尚未结束，请稍候。")
+                return
+            parsed = self.payload_from_box()
+            if parsed:
+                self.start_send(parsed)
+
+        def replay_tick(self):
+            if self.send_job.busy():
+                if not self.handle:
+                    return                      # 断开流程会在调用结束后接管
+                result = self.send_job.poll(self.handle)
+                if result == -1:
+                    return
+                if result == 1:
+                    self.replay_sent += 1
+                    self.replay_status.set("已发送 %d 次。" % self.replay_sent)
+                elif result == 2:
+                    self.loop_var.set(False)
+                    self.replay_status.set("发送调用异常（原生函数内部出错），循环已停。")
+                elif result == -3:
+                    self.loop_var.set(False)
+                    self.replay_status.set("发送调用超时，线程已强杀；建议重新连接游戏。")
+                else:
+                    self.loop_var.set(False)
+                    self.replay_status.set("发送返回未知状态 %s，循环已停。" % result)
+                return
+            if not self.loop_var.get() or not self.handle:
+                return
+            if self.loop_left == 0:
+                self.loop_var.set(False)
+                self.replay_status.set("循环重放完成，共发送 %d 次。" % self.replay_sent)
+                return
+            interval = parse_ms(self.loop_interval.get(), 1000) or 1000
+            if self.loop_last and now_ms() - self.loop_last < interval:
+                return
+            parsed = self.payload_from_box()
+            if parsed is None:
+                self.loop_var.set(False)
+                return
+            if self.loop_left > 0:
+                self.loop_left -= 1
+            self.loop_last = now_ms()
+            if not self.start_send(parsed):
+                self.loop_var.set(False)
 
         def start_kill(self):
             if self.kill_busy() or self.auto_fault:
@@ -1743,6 +2493,8 @@ def run_ui():
             # 秒杀独立 30ms 循环（C++ 版为 20ms 定时器），不随属性 tick 变慢
             if self.handle:
                 self.auto_tick()
+            self.capture_tick()
+            self.replay_tick()
             self.move_tick()
             self.click_tick()
             self.mem_tick()
@@ -1769,6 +2521,7 @@ def run_ui():
                 self.status.set("当前已是管理员权限，无需提权。")
                 return
             if elevate():
+                self.stop_capture()
                 self.status.set("正在以管理员身份重启…")
                 self.root.after(300, self.root.destroy)
             else:
