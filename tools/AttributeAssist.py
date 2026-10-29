@@ -1149,6 +1149,25 @@ def parse_filter_ids(text):
     return ids
 
 
+def pe_sections(hdr):
+    """从 'PE\\0\\0' 签名起的头块 → [(节名, RVA, 虚拟大小, 特征)]；解析失败返回 []。"""
+    if len(hdr) < 24 or hdr[:4] != b"PE\x00\x00":
+        return []
+    nsec = struct.unpack_from("<H", hdr, 6)[0]
+    size_opt = struct.unpack_from("<H", hdr, 20)[0]
+    off = 24 + size_opt
+    out = []
+    for i in range(nsec):
+        raw = hdr[off + i * 40: off + (i + 1) * 40]
+        if len(raw) < 40:
+            break
+        name = raw[:8].split(b"\x00")[0].decode("latin1").rstrip()
+        vsize, va = struct.unpack_from("<II", raw, 8)
+        chars = struct.unpack_from("<I", raw, 36)[0]
+        out.append((name, va, vsize, chars))
+    return out
+
+
 def parse_capture_slot(blob):
     """512 字节槽 → 记录；len 超上限按上限截断（写入端已截断，双保险）。"""
     packet_id, n, marker = struct.unpack_from("<III", blob, 0)
@@ -1432,6 +1451,19 @@ def self_test():
     ok = ok and packet_line(3, {"time": "12:00:00", "id": 8121, "mine": True,
                                 "data": b"\x55\x8B\xEC"}).startswith("#3")
 
+    # PE 节表解析（导出代码段用）：合成 2 节头块
+    def sec(name, vsize, va, chars):
+        return name.ljust(8).encode("latin1") + struct.pack("<II", vsize, va) + \
+            b"\x00" * 20 + struct.pack("<I", chars)
+    hdr = b"PE\x00\x00" + struct.pack("<HHIIIHH", 0x14C, 2, 0, 0, 0, 0xE0, 0x22) + \
+        b"\x00" * 0xE0 + sec(".text", 0x1000, 0x1000, 0x60000020) + \
+        sec(".rdata", 0x2000, 0x2000, 0x40000040)
+    parsed_secs = pe_sections(hdr)
+    ok = ok and len(parsed_secs) == 2 and parsed_secs[0][0] == ".text" \
+        and parsed_secs[0][2] == 0x1000 and parsed_secs[0][3] == 0x60000020 \
+        and parsed_secs[1][1] == 0x2000
+    ok = ok and pe_sections(b"MZ\x00\x00") == [] and pe_sections(b"") == []
+
     # 毫秒解析（自动点击/重放循环间隔）：与秒制的 parse_delay_ms 区分
     ok = ok and parse_ms("500", 500) == 500 and parse_ms("", 500) == 500
     ok = ok and parse_ms("0", 500) == 0 and parse_ms("-3", 500) == 0
@@ -1679,6 +1711,8 @@ def run_ui():
                        command=self.save_packets).pack(side="left", padx=(4, 0))
             ttk.Button(crow, text="载入记录",
                        command=self.load_packets).pack(side="left", padx=(4, 0))
+            ttk.Button(crow, text="导出代码段",
+                       command=self.dump_code_sections).pack(side="left", padx=(4, 0))
             lrow = ttk.Frame(replaybox)
             lrow.pack(fill="x", padx=8, pady=2)
             self.packet_list = tk.Listbox(lrow, height=6, width=92, font="TkFixedFont")
@@ -2312,6 +2346,52 @@ def run_ui():
             self.packets = records
             self.refresh_packet_list()
             self.replay_status.set("已载入 %d 条记录。" % len(records))
+
+        def dump_code_sections(self):
+            """导出主模块 PE 头与可执行/只读数据段到文件，供离线分析真正的发包路径。"""
+            if not self.handle or not self.base:
+                self.replay_status.set("导出代码段：请先连接游戏进程。")
+                return
+            dos = read_mem(self.handle, self.base, 0x40)
+            e_lfanew = struct.unpack_from("<I", dos, 0x3C)[0] \
+                if dos and dos[:2] == b"MZ" else 0
+            nt = read_mem(self.handle, self.base + e_lfanew, 0x800) if e_lfanew else b""
+            secs = pe_sections(nt) if nt else []
+            if not secs:
+                self.replay_status.set("导出失败：主模块 PE 头解析失败。")
+                return
+            out_dir = os.path.dirname(os.path.abspath(sys.argv[0])) or "."
+            manifest = {"module_base": self.base, "send_rva": KILL_SEND_OFF,
+                        "sections": []}
+            total = 0
+            for name, va, vsize, chars in secs:
+                want = bool(chars & 0x20000000) or name.lower() in (".rdata", ".rodata")
+                entry = {"name": name, "va": va, "vsize": vsize,
+                         "chars": chars, "dump": want}
+                manifest["sections"].append(entry)
+                if not want or not vsize:
+                    continue
+                blob = read_mem(self.handle, self.base + va, min(vsize, 0x4000000))
+                entry["read"] = len(blob) if blob else 0
+                if blob:
+                    safe = "".join(ch if ch.isalnum() else "_" for ch in name) or "sec"
+                    try:
+                        with open(os.path.join(out_dir, "code_%s_%x.bin" % (safe, va)),
+                                  "wb") as fp:
+                            fp.write(blob)
+                        total += len(blob)
+                    except OSError as exc:
+                        entry["error"] = str(exc)
+            try:
+                with open(os.path.join(out_dir, "code_manifest.json"), "w",
+                          encoding="utf-8") as fp:
+                    json.dump(manifest, fp, ensure_ascii=False, indent=1)
+            except OSError as exc:
+                self.replay_status.set("导出失败：%s" % exc)
+                return
+            self.replay_status.set("已导出 %.1f MB 代码段到 %s；把生成的 code_*.bin 和 "
+                                   "code_manifest.json 一起发回即可。"
+                                   % (total / 1048576.0, out_dir))
 
         def load_selected_packet(self):
             sel = self.packet_list.curselection()
