@@ -1847,6 +1847,8 @@ def run_ui():
             ttk.Button(srow, text="发送一次", command=self.send_once).pack(side="left")
             ttk.Button(srow, text="连发序列",
                        command=self.send_batch).pack(side="left", padx=(8, 0))
+            ttk.Button(srow, text="一键结算",
+                       command=self.one_key_settle).pack(side="left", padx=(8, 0))
             ttk.Checkbutton(srow, text="循环", variable=self.loop_var,
                             command=self.on_loop_toggle).pack(side="left", padx=(10, 0))
             ttk.Label(srow, text="间隔(ms):").pack(side="left", padx=(8, 2))
@@ -2634,6 +2636,53 @@ def run_ui():
             self.batch_total = len(batch)
             self.replay_status.set("连发序列已排队 %d 个（%s 同一秒，原样按序发送）。"
                                    % (len(batch), stamp or "无时间戳"))
+
+        def one_key_settle(self):
+            """一键结算：取最近握手包（8071/8291/8121）尾部的本局 token，替换进
+            最近一条 4110 模板（0x47/0x9E 两处），连同其后同一秒的确认包按序连发。
+            对局进行中可直接用；房间模拟整局时在握手连发后约 10 秒点本按钮。"""
+            if not self.handle:
+                self.replay_status.set("请先选择进程并点「启动」。")
+                return
+            if self.send_job.busy() or self.batch_queue:
+                self.replay_status.set("发送进行中，请稍候。")
+                return
+            if self.loop_var.get():
+                self.replay_status.set("循环重放进行中，请先关闭。")
+                return
+            token = None
+            for rec in reversed(self.packets):
+                if rec["id"] in (8071, 8291, 8121) and len(rec["data"]) >= 8:
+                    token = rec["data"][-4:]        # 握手包尾部 4 字节 = 本局 token
+                    break
+            if not token:
+                self.replay_status.set("列表里没有握手包（8071/8291/8121），"
+                                       "先开抓包进一局或先连发握手序列。")
+                return
+            idx = next((i for i in range(len(self.packets) - 1, -1, -1)
+                        if self.packets[i]["id"] == 4110
+                        and len(self.packets[i]["data"]) >= 0xA2), None)
+            if idx is None:
+                self.replay_status.set("列表里没有 4110 模板（需 ≥162 字节），先载入记录。")
+                return
+            tmpl = self.packets[idx]
+            old = bytes(tmpl["data"][0x47:0x4B])
+            if bytes(tmpl["data"][0x9E:0xA2]) != old:
+                self.replay_status.set("4110 模板 token 位置校验失败（0x47/0x9E 不一致），"
+                                       "请换一条 4110 模板。")
+                return
+            payload = tmpl["data"].replace(old, token)
+            batch = [dict(tmpl, data=payload, a4=len(payload))]
+            for rec in self.packets[idx + 1:]:
+                if rec.get("time", "") != tmpl.get("time", "") or not rec["data"]:
+                    break
+                batch.append(rec)
+            del batch[32:]
+            self.batch_queue = batch
+            self.batch_total = len(batch)
+            self.replay_status.set("一键结算排队 %d 个，token %s → %s%s。"
+                                   % (len(batch), old.hex().upper(), token.hex().upper(),
+                                      "（未变）" if token == old else ""))
 
         def send_once(self):
             if not self.handle:
