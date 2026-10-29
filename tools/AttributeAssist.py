@@ -1616,7 +1616,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1030d")
+            root.title("属性助手 · 单机版 v1030e（一键胜利）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -1852,6 +1852,8 @@ def run_ui():
                        command=self.send_batch).pack(side="left", padx=(8, 0))
             ttk.Button(srow, text="一键结算",
                        command=self.one_key_settle).pack(side="left", padx=(8, 0))
+            ttk.Button(srow, text="一键胜利",
+                       command=self.one_key_win).pack(side="left", padx=(8, 0))
             ttk.Checkbutton(srow, text="带确认包", variable=self.settle_extras_var
                             ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="循环", variable=self.loop_var,
@@ -2748,6 +2750,69 @@ def run_ui():
                                    % (len(batch), idx + 1, old.hex().upper(), token.hex().upper(),
                                       "（未变）" if token == old else
                                       ("，含确认包" if len(batch) > 1 else "，仅 4110")))
+
+        def one_key_win(self):
+            """一键胜利（实测组合，在要判负的号 10310 端运行）：
+            先发 8071(94B) 再发 4110，两包均换上本局 token → 服务器判本号死亡、
+            对手胜利结算并发奖。94B 取选中行或最近一条游戏发的 8071(94B)
+            （尾部 4 字节换 token）；4110 取选中行或最近一条游戏发的 4110
+            （0x47/0x9E 换 token，需死亡方模板 0x02=0000）。"""
+            if not self.handle:
+                self.replay_status.set("请先选择进程并点「启动」。")
+                return
+            if self.send_job.busy() or self.batch_queue:
+                self.replay_status.set("发送进行中，请稍候。")
+                return
+            if self.loop_var.get():
+                self.replay_status.set("循环重放进行中，请先关闭。")
+                return
+            token = None
+            for rec in reversed(self.packets):
+                if not rec.get("mine") and rec["id"] in (8071, 8291, 8121) \
+                        and len(rec["data"]) >= 8:
+                    token = rec["data"][-4:]
+                    break
+            if not token:
+                self.replay_status.set("列表里没有游戏发的握手包（8071/8291/8121），"
+                                       "先开抓包进一局。")
+                return
+            sel = self.packet_list.curselection()
+            cand = self.view[sel[0]] if sel else None
+
+            def pick(pred, what):
+                if cand is not None and pred(cand) and not cand.get("mine"):
+                    return next(i for i, r in enumerate(self.packets) if r is cand)
+                return next((i for i in range(len(self.packets) - 1, -1, -1)
+                             if pred(self.packets[i])
+                             and not self.packets[i].get("mine")), None)
+
+            i94 = pick(lambda r: r["id"] == 8071 and len(r["data"]) == 94,
+                       "8071(94B)")
+            i4110 = pick(lambda r: r["id"] == 4110 and len(r["data"]) >= 0xA2,
+                         "4110")
+            if i94 is None or i4110 is None:
+                self.replay_status.set("缺模板：需要 8071(94B)%s 和死亡方 4110%s"
+                                       "（载入死亡局记录，或选中对应行）。"
+                                       % ("，已找到" if i94 is not None else "，未找到",
+                                          "，已找到" if i4110 is not None else "，未找到"))
+                return
+            rec94 = self.packets[i94]
+            old94 = bytes(rec94["data"][-4:])
+            payload94 = rec94["data"][:-4] + token
+            tmpl = self.packets[i4110]
+            old = bytes(tmpl["data"][0x47:0x4B])
+            if bytes(tmpl["data"][0x9E:0xA2]) != old:
+                self.replay_status.set("4110 模板 token 位置校验失败（0x47/0x9E 不一致）。")
+                return
+            payload4110 = tmpl["data"].replace(old, token)
+            batch = [dict(rec94, data=payload94, a4=len(payload94)),
+                     dict(tmpl, data=payload4110, a4=len(payload4110))]
+            self.batch_queue = batch
+            self.batch_total = len(batch)
+            self.replay_status.set("一键胜利排队 94B(#%d, token %s→%s) + 4110(#%d, "
+                                   "token %s→%s)，按序连发。"
+                                   % (i94 + 1, old94.hex().upper(), token.hex().upper(),
+                                      i4110 + 1, old.hex().upper(), token.hex().upper()))
 
         def send_once(self):
             if not self.handle:
