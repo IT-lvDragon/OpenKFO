@@ -984,7 +984,8 @@ def hook_code(code_base, data_base, send_addr, stolen):
     c.bytes_((0x8D, 0x7A, 0x0C))                    # lea edi, [edx+12]
     c.bytes_((0x8B, 0xF3))                          # mov esi, ebx
     c.bytes_((0xF3, 0xA4))                          # rep movsb
-    c.bytes_((0x9D, 0x61))                          # popfd/popad
+    c.bytes_((0x61, 0x9D))                          # popad/popfd：与压栈 9C,60 严格逆序，
+                                                    # 先弹 flags 会把 EDI 当 EFLAGS、把 EFLAGS 装进 ESP
     c.bytes_(tuple(stolen))                         # 被覆盖的原指令
     c.bytes_((0xE9,))                               # jmp send+len(stolen)
     p = c.hole()
@@ -1390,6 +1391,8 @@ def self_test():
     ok = ok and struct.pack("<I", 0x10001000 + HOOK_MARKER_OFF) in hcode
     ok = ok and struct.pack("<I", 0x10001000 + HOOK_SLOTS_OFF) in hcode
     ok = ok and hcode[len(hcode) - len(stolen) - 5:len(hcode) - 5] == stolen
+    ok = ok and hcode[len(hcode) - len(stolen) - 7:len(hcode) - len(stolen) - 5] == b"\x61\x9D"
+    # 恢复必须 popad→popfd（压栈 9C,60 的逆序）：反序会把 EDI 弹进 EFLAGS、把 EFLAGS 装进 ESP
     ok = ok and hcode[-5] == 0xE9
     rel = struct.unpack_from("<I", hcode, len(hcode) - 4)[0]
     ok = ok and 0x10000000 + len(hcode) + rel == send_addr + len(stolen)
