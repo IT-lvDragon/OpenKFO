@@ -1616,7 +1616,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1029b（一键结算仅4110）")
+            root.title("属性助手 · 单机版 v1029c（结算只用真实包）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2656,18 +2656,29 @@ def run_ui():
                 return
             token = None
             for rec in reversed(self.packets):
-                if rec["id"] in (8071, 8291, 8121) and len(rec["data"]) >= 8:
-                    token = rec["data"][-4:]        # 握手包尾部 4 字节 = 本局 token
+                if not rec.get("mine") and rec["id"] in (8071, 8291, 8121) \
+                        and len(rec["data"]) >= 8:
+                    token = rec["data"][-4:]        # 游戏真实握手包尾部 4 字节 = 本局 token
                     break
             if not token:
-                self.replay_status.set("列表里没有握手包（8071/8291/8121），"
-                                       "先开抓包进一局或先连发握手序列。")
+                self.replay_status.set("列表里没有游戏发的握手包（8071/8291/8121），"
+                                       "先开抓包进一局。")
                 return
-            idx = next((i for i in range(len(self.packets) - 1, -1, -1)
-                        if self.packets[i]["id"] == 4110
-                        and len(self.packets[i]["data"]) >= 0xA2), None)
+            sel = self.packet_list.curselection()
+            idx = None
+            if sel:
+                cand = self.view[sel[0]]
+                if cand["id"] == 4110 and len(cand["data"]) >= 0xA2 \
+                        and not cand.get("mine"):
+                    idx = next(i for i, r in enumerate(self.packets) if r is cand)
             if idx is None:
-                self.replay_status.set("列表里没有 4110 模板（需 ≥162 字节），先载入记录。")
+                idx = next((i for i in range(len(self.packets) - 1, -1, -1)
+                            if self.packets[i]["id"] == 4110
+                            and len(self.packets[i]["data"]) >= 0xA2
+                            and not self.packets[i].get("mine")), None)
+            if idx is None:
+                self.replay_status.set("列表里没有游戏发的 4110 模板（需 ≥162 字节），"
+                                       "先载入记录，或选中一条游戏发的 4110。")
                 return
             tmpl = self.packets[idx]
             old = bytes(tmpl["data"][0x47:0x4B])
@@ -2685,8 +2696,8 @@ def run_ui():
                 del batch[32:]
             self.batch_queue = batch
             self.batch_total = len(batch)
-            self.replay_status.set("一键结算排队 %d 个，token %s → %s%s。"
-                                   % (len(batch), old.hex().upper(), token.hex().upper(),
+            self.replay_status.set("一键结算排队 %d 个，模板 #%d（游戏包），token %s → %s%s。"
+                                   % (len(batch), idx + 1, old.hex().upper(), token.hex().upper(),
                                       "（未变）" if token == old else
                                       ("，含确认包" if len(batch) > 1 else "，仅 4110")))
 
