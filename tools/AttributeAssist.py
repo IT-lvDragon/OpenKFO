@@ -1616,7 +1616,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版")
+            root.title("属性助手 · 单机版 v1029b（一键结算仅4110）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
