@@ -1616,7 +1616,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1030c（跨号共享token）")
+            root.title("属性助手 · 单机版 v1030d")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -1805,7 +1805,6 @@ def run_ui():
             self.batch_queue = []        # 连发序列待发记录
             self.batch_total = 0
             self.settle_extras_var = tk.BooleanVar(value=False)  # 一键结算是否附带确认包
-            self.out_dir = os.path.dirname(os.path.abspath(sys.argv[0])) or "."
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
             ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
@@ -2425,16 +2424,6 @@ def run_ui():
                 self.packets.extend(fresh)
                 if len(self.packets) > 400:
                     del self.packets[:len(self.packets) - 400]
-                for rec in fresh:                 # 本局 token 共享给同机其他工具实例
-                    if not rec.get("mine") and rec["id"] in (8071, 8291, 8121) \
-                            and len(rec["data"]) >= 8 \
-                            and rec["data"][-4:] != b"\x00\x00\x00\x00":
-                        try:
-                            with open(os.path.join(self.out_dir, "last_token.txt"),
-                                      "w") as fp:
-                                fp.write(rec["data"][-4:].hex().upper())
-                        except OSError:
-                            pass
                 self.refresh_packet_list()
 
         def refresh_packet_list(self):
@@ -2597,16 +2586,7 @@ def run_ui():
                     token = rec["data"][-4:]
                     break
             if not token:
-                try:                              # 本进程无握手包（如无装备号），读同机共享 token
-                    with open(os.path.join(self.out_dir, "last_token.txt")) as fp:
-                        hexs = fp.read().strip()
-                    if len(hexs) == 8:
-                        token = bytes.fromhex(hexs)
-                except (OSError, ValueError):
-                    token = None
-            if not token:
-                self.replay_status.set("列表里没有游戏发的握手包，且未找到 last_token.txt"
-                                       "（先让 10063 端开抓包进对局）。")
+                self.replay_status.set("列表里没有游戏发的握手包（8071/8291/8121），先进一局。")
                 return
             if len(payload) < 0xA2 or payload[0x47:0x4B] != payload[0x9E:0xA2]:
                 if len(payload) < 8:
