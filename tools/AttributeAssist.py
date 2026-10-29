@@ -418,8 +418,8 @@ def user32():
             wintypes.LPARAM]
         _u32.GetForegroundWindow.restype = wintypes.HWND
         _u32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-        _u32.GetSystemMetrics.argtypes = [ctypes.c_int]
-        _u32.GetSystemMetrics.restype = ctypes.c_int
+        _u32.SetCursorPos.argtypes = [wintypes.LONG, wintypes.LONG]
+        _u32.SetCursorPos.restype = wintypes.BOOL
     return _u32
 
 
@@ -443,10 +443,19 @@ def find_main_window(pid):
     return found[0] if found else 0
 
 
-def game_foreground(hwnd):
-    """游戏窗口是否处于前台；模拟输入只投递给前台，避免打进别的程序。"""
+def game_foreground(pid):
+    """前台窗口是否属于该进程；模拟输入只投递给前台，避免打进别的程序。
+    按进程 ID 判定而非窗口句柄严格比对：游戏常有多个顶层窗口，枚举到的
+    第一个未必是玩家正在用的前台窗口，句柄比对会永远判为“不在前台”。"""
+    if not pid:
+        return False
     lib = user32()
-    return bool(hwnd) and lib.GetForegroundWindow() == hwnd
+    fg = lib.GetForegroundWindow()
+    if not fg:
+        return False
+    owner = wintypes.DWORD()
+    lib.GetWindowThreadProcessId(fg, ctypes.byref(owner))
+    return owner.value == pid
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -504,7 +513,6 @@ def send_move_key(hwnd, vk, down):
     return lib.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
 
 
-MOUSEEVENTF_MOVE, MOUSEEVENTF_ABSOLUTE = 0x0001, 0x8000
 MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN = 0x0002, 0x0008
 
 
@@ -512,13 +520,6 @@ def mouse_flags(button, down):
     """鼠标事件标志：按下取 DOWN 值，抬起 = 按下 << 1（LEFTUP=4 / RIGHTUP=0x10）。"""
     base = MOUSEEVENTF_RIGHTDOWN if button == "右键" else MOUSEEVENTF_LEFTDOWN
     return base if down else base << 1
-
-
-def abs_coord(x, y, w, h):
-    """屏幕像素 → SendInput 绝对坐标 0..65535（两端对齐，越界截断到屏幕内）。"""
-    x = max(0, min(int(x), int(w) - 1))
-    y = max(0, min(int(y), int(h) - 1))
-    return x * 65535 // (w - 1), y * 65535 // (h - 1)
 
 
 def jitter_point(x, y, radius):
@@ -529,20 +530,18 @@ def jitter_point(x, y, radius):
 
 
 def send_mouse_click(x, y, button="左键"):
-    """SendInput 前台注入一次鼠标点击：绝对坐标移动、按下、抬起。"""
+    """SetCursorPos 定位 + SendInput 按下/抬起。不走 MOUSEEVENTF_ABSOLUTE：
+    其 0..65535 归一化按物理像素解释，DPI 缩放/多屏时与 GetCursorPos 拾取的
+    逻辑坐标错位；SetCursorPos 与拾取同处一个坐标空间，点到即拾取点。"""
     lib = user32()
-    w = lib.GetSystemMetrics(0)
-    h = lib.GetSystemMetrics(1)
-    ax, ay = abs_coord(x, y, w, h)
-    move = INPUT(type=0)  # INPUT_MOUSE
-    move.union.mi.dx, move.union.mi.dy = ax, ay
-    move.union.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
-    down = INPUT(type=0)
+    if not lib.SetCursorPos(int(x), int(y)):
+        return False
+    down = INPUT(type=0)  # INPUT_MOUSE
     down.union.mi.dwFlags = mouse_flags(button, True)
     up = INPUT(type=0)
     up.union.mi.dwFlags = mouse_flags(button, False)
-    events = (INPUT * 3)(move, down, up)
-    return lib.SendInput(3, events, ctypes.sizeof(INPUT)) == 3
+    events = (INPUT * 2)(down, up)
+    return lib.SendInput(2, events, ctypes.sizeof(INPUT)) == 2
 
 
 def parse_pixels(text, default=0):
@@ -1019,13 +1018,6 @@ def self_test():
     # SendInput 键盘标志（扫描码模式）：8=SCANCODE，1=EXTENDEDKEY，2=KEYUP
     ok = ok and kb_flags(0x44, True) == 8 and kb_flags(0x44, False) == 10
     ok = ok and kb_flags(0x27, True) == 9 and kb_flags(0x27, False) == 11
-
-    # 绝对坐标归一化：两端对齐、越界截断
-    ok = ok and abs_coord(0, 0, 1920, 1080) == (0, 0)
-    ok = ok and abs_coord(1919, 1079, 1920, 1080) == (65535, 65535)
-    ok = ok and abs_coord(-5, 2000, 1920, 1080) == (0, 65535)
-    ok = ok and abs_coord(960, 540, 1920, 1080) == (960 * 65535 // 1919,
-                                                    540 * 65535 // 1079)
 
     # 区域随机取点：半径 0 即精确点；半径 r 时必然落在 [-r, +r] 内
     ok = ok and jitter_point(100, 200, 0) == (100, 200)
@@ -1597,7 +1589,7 @@ def run_ui():
                 if not self.move_hwnd:
                     self.move_status.set("未找到游戏窗口，无法发送按键。")
                     return
-            if not game_foreground(self.move_hwnd):
+            if not game_foreground(self.pid):
                 # SendInput 作用于前台窗口：游戏不在前台时不投递，避免按键打进别的程序
                 if self.move_pressed:
                     send_move_key(self.move_hwnd, vk, False)
@@ -1655,7 +1647,7 @@ def run_ui():
                 if not self.click_hwnd:
                     self.click_status.set("未找到游戏窗口，自动点击暂停。")
                     return
-            if not game_foreground(self.click_hwnd):
+            if not game_foreground(self.pid):
                 # SendInput 作用于前台窗口：游戏不在前台时不投递，避免点击打进别的程序
                 self.click_status.set("游戏窗口不在前台，自动点击已暂停；切回游戏窗口即自动恢复。")
                 return
