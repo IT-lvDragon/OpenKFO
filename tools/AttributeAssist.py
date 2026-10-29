@@ -2333,7 +2333,7 @@ def run_ui():
                 return None
             replay_addr = send_addr
             if stolen[:1] == b"\xE9" and relocs:
-                replay_addr = relocs[0][1]   # E9 thunk：重放直接调真身，绕开钩子
+                replay_addr = relocs[0][1]   # E9 thunk 真身地址（记录备用，重放现统一走入口）
             return [rva, name, block, stolen, replay_addr]
 
         def start_capture(self):
@@ -2404,7 +2404,7 @@ def run_ui():
                     if not blob:
                         continue
                     rec = parse_capture_slot(blob)
-                    if rec["data"] and not rec["mine"]:   # 重放回声（marker=1）不入列表
+                    if rec["data"]:                       # 重放回声（marker=1）标注「我发」入列表
                         rec["time"] = time.strftime("%H:%M:%S")
                         rec["fn"] = rva
                         fresh.append(rec)
@@ -2582,8 +2582,9 @@ def run_ui():
             packet_id, payload = parsed
             hook = next((h for h in self.capture_hooks if h[0] == self.edit_fn), None)
             marker = hook[2] + 0x1000 + HOOK_MARKER_OFF if hook else 0
-            # 战斗族重放必经钩子入口（原函数体已覆盖）；大厅A/B 优先走 E9 真身绕开钩子
-            fn_addr = hook[4] if hook else self.base + self.edit_fn
+            # 重放统一走函数入口：已钩住时经 stub 记一条「我发」回声便于确认，
+            # 未钩住时入口即原函数（大厅A/B 是 E9 thunk，同样直达真身）
+            fn_addr = self.base + self.edit_fn
             pushes = replay_pushes(self.edit_fn, packet_id, payload,
                                    self.edit_a2, self.edit_a3, self.edit_a4)
             if self.send_job.start(self.handle, fn_addr, pushes, payload, marker):
