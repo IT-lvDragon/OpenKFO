@@ -1058,6 +1058,31 @@ def settings_path():
     return os.path.join(folder, "AttributeAssist.json")
 
 
+def is_admin():
+    """当前进程是否以管理员身份运行；非 Windows 或查询失败返回 False。"""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (OSError, AttributeError):
+        return False
+
+
+def elevate():
+    """以管理员身份重启当前进程（触发 UAC）。成功返回 True，用户取消/失败返回 False。"""
+    import sys
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        params = " ".join('"%s"' % a for a in sys.argv[1:])
+    else:
+        exe = sys.executable
+        params = '"%s" %s' % (sys.argv[0],
+                              " ".join('"%s"' % a for a in sys.argv[1:]))
+    try:
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        return result > 32
+    except OSError:
+        return False
+
+
 def run_ui():
     import tkinter as tk
     from tkinter import ttk
@@ -1093,6 +1118,8 @@ def run_ui():
             ttk.Button(top, text="停止并断开", command=self.stop_clicked).grid(row=0, column=2)
             ttk.Button(top, text="清理游戏内存", command=self.clean_memory).grid(row=0, column=3,
                                                                                  padx=(8, 0))
+            ttk.Button(top, text="以管理员重启", command=self.elevate_self).grid(
+                row=0, column=4, padx=(8, 0))
 
             memframe = ttk.Frame(root)
             memframe.pack(fill="x", padx=12, pady=(0, 2))
@@ -1237,6 +1264,9 @@ def run_ui():
 
             self.load_settings()
             self.refresh()
+            if not is_admin():
+                self.status.set("当前非管理员权限；若游戏以管理员运行，启动会提示拒绝访问，"
+                                "可点右上角「以管理员重启」。")
             root.after(100, self.tick)
             root.after(30, self.auto_loop)  # C++ 版 20ms 定时器驱动，30ms 足够接近
             root.after(1000, self.refresh)
@@ -1356,8 +1386,8 @@ def run_ui():
             if not handle:
                 error = ctypes.get_last_error()
                 if error == 5:
-                    self.status.set("无法打开进程（拒绝访问）。若游戏以管理员运行，"
-                                    "请同样以管理员运行本脚本。")
+                    self.status.set("无法打开进程（拒绝访问）。游戏大概率以管理员运行；"
+                                    "点右上角「以管理员重启」或右键本程序以管理员运行。")
                 else:
                     self.status.set(f"无法打开进程（错误码 {error}）。")
                 return
@@ -1740,6 +1770,17 @@ def run_ui():
                 self.mem_status.set("已请求系统裁剪游戏工作集；游戏首次访问被换出页面时可能短暂卡顿。")
             else:
                 self.mem_status.set("清理失败（错误码 %d）。" % ctypes.get_last_error())
+
+        def elevate_self(self):
+            """以管理员身份重启本程序（UAC 弹窗）；当前实例随后退出。"""
+            if is_admin():
+                self.status.set("当前已是管理员权限，无需提权。")
+                return
+            if elevate():
+                self.status.set("正在以管理员身份重启…")
+                self.root.after(300, self.root.destroy)
+            else:
+                self.status.set("提权被取消或失败。")
 
         def mem_tick(self):
             if not self.mem_auto.get() or not self.handle:
