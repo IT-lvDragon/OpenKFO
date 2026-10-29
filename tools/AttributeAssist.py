@@ -1616,7 +1616,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1030a（握手包尾部换token）")
+            root.title("属性助手 · 单机版 v1030b（支持空信号包）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2612,8 +2612,15 @@ def run_ui():
                                    % (old.hex().upper(), token.hex().upper()))
 
         def payload_from_box(self):
-            """编辑区内容 → (id, bytes)；非法时在状态栏提示并返回 None。"""
-            payload = parse_hex(self.hex_box.get("1.0", "end"))
+            """编辑区内容 → (id, bytes)；允许空包体（如 8121/8286 空信号包）。"""
+            raw = self.hex_box.get("1.0", "end").strip()
+            if not raw:
+                try:
+                    return int(self.replay_id.get().strip(), 0), b""
+                except ValueError:
+                    self.replay_status.set("数据包 ID 非法（十进制或 0x 十六进制）。")
+                    return None
+            payload = parse_hex(raw)
             if payload is None or not payload:
                 self.replay_status.set("包体为空或 hex 非法（成对十六进制，如 55 8B EC）。")
                 return None
