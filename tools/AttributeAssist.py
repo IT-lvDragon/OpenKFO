@@ -1802,6 +1802,8 @@ def run_ui():
             self.loop_left = 0
             self.loop_last = 0
             self.replay_sent = 0
+            self.batch_queue = []        # 连发序列待发记录
+            self.batch_total = 0
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
             ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
@@ -1843,6 +1845,8 @@ def run_ui():
             srow = ttk.Frame(replaybox)
             srow.pack(fill="x", padx=8, pady=(0, 2))
             ttk.Button(srow, text="发送一次", command=self.send_once).pack(side="left")
+            ttk.Button(srow, text="连发序列",
+                       command=self.send_batch).pack(side="left", padx=(8, 0))
             ttk.Checkbutton(srow, text="循环", variable=self.loop_var,
                             command=self.on_loop_toggle).pack(side="left", padx=(10, 0))
             ttk.Label(srow, text="间隔(ms):").pack(side="left", padx=(8, 2))
@@ -2593,6 +2597,44 @@ def run_ui():
                                    % self.send_job.start_error)
             return False
 
+        def start_send_rec(self, rec):
+            """按记录自带的来源函数与参数原样入队发送（连发序列用）。"""
+            self.edit_fn = rec.get("fn", KILL_SEND_OFF) & 0xFFFFFFFF
+            self.edit_a2 = rec.get("a2", 0) & 0xFFFFFFFF
+            self.edit_a3 = rec.get("a3", 0) & 0xFFFFFFFF
+            self.edit_a4 = rec.get("a4", 0) & 0xFFFFFFFF
+            return self.start_send((rec["id"], rec["data"]))
+
+        def send_batch(self):
+            """选中行与其后同一秒抓到的记录，按抓包顺序原样连发（结算簇重放）。"""
+            if not self.handle:
+                self.replay_status.set("请先选择进程并点「启动」。")
+                return
+            if self.send_job.busy():
+                self.replay_status.set("上一次发送尚未结束，请稍候。")
+                return
+            if self.loop_var.get():
+                self.replay_status.set("循环重放进行中，请先关闭再连发序列。")
+                return
+            sel = self.packet_list.curselection()
+            if not sel:
+                self.replay_status.set("先选中序列的第一包（如 4110），再点连发序列。")
+                return
+            stamp = self.view[sel[0]].get("time", "")
+            batch = [self.view[sel[0]]]
+            for rec in self.view[sel[0] + 1:]:
+                if rec.get("time", "") != stamp or not rec["data"]:
+                    break
+                batch.append(rec)
+            del batch[32:]
+            if not batch[0]["data"]:
+                self.replay_status.set("选中行没有包体，无法发送。")
+                return
+            self.batch_queue = list(batch)
+            self.batch_total = len(batch)
+            self.replay_status.set("连发序列已排队 %d 个（%s 同一秒，原样按序发送）。"
+                                   % (len(batch), stamp or "无时间戳"))
+
         def send_once(self):
             if not self.handle:
                 self.replay_status.set("请先选择进程并点「启动」。")
@@ -2613,16 +2655,34 @@ def run_ui():
                     return
                 if result == 1:
                     self.replay_sent += 1
-                    self.replay_status.set("已发送 %d 次。" % self.replay_sent)
+                    if not self.batch_queue and self.batch_total:
+                        self.replay_status.set("连发序列完成，共发送 %d 个。" % self.batch_total)
+                        self.batch_total = 0
+                    else:
+                        self.replay_status.set("已发送 %d 次。" % self.replay_sent)
                 elif result == 2:
                     self.loop_var.set(False)
+                    self.batch_queue = []
+                    self.batch_total = 0
                     self.replay_status.set("发送调用异常（原生函数内部出错），循环已停。")
                 elif result == -3:
                     self.loop_var.set(False)
+                    self.batch_queue = []
+                    self.batch_total = 0
                     self.replay_status.set("发送调用超时，线程已强杀；建议重新连接游戏。")
                 else:
                     self.loop_var.set(False)
+                    self.batch_queue = []
+                    self.batch_total = 0
                     self.replay_status.set("发送返回未知状态 %s，循环已停。" % result)
+                return
+            if self.batch_queue and not self.loop_var.get():
+                rec = self.batch_queue.pop(0)
+                self.replay_status.set("连发序列：发送 id=%d（队列剩 %d）…"
+                                       % (rec["id"], len(self.batch_queue)))
+                if not self.start_send_rec(rec):
+                    self.batch_queue = []
+                    self.batch_total = 0
                 return
             if not self.loop_var.get() or not self.handle:
                 return
