@@ -860,11 +860,28 @@ class KillJob:
 HOOK_CTR_OFF = 0        # 抓包数据块：发包计数器（游戏线程 lock xadd 递增）
 HOOK_MARKER_OFF = 4     # 抓包数据块：重放标记（重放线程置 1，钩子记录进槽）
 HOOK_SLOTS_OFF = 8      # 槽区起点
-HOOK_SLOT_HDR = 12      # 槽头：id(4) + len(4) + marker(4)
-HOOK_SLOT_DATA = 500    # 槽内包体上限
-HOOK_SLOT_SIZE = 512    # 槽总大小 = 头 + 包体
+HOOK_SLOT_HDR = 24      # 槽头：id(4) + len(4) + a2(4) + a3(4) + a4(4) + meta(4)
+HOOK_SLOT_DATA = 1000   # 槽内包体上限
+HOOK_SLOT_SIZE = 1024   # 槽总大小（2 的幂，stub 用 shl 10 寻址）
 HOOK_SLOTS = 64         # 环形槽数；两次轮询之间超过 64 包会丢最旧的
 HOOK_READ_BYTES = 16    # 入口序言检查需读取的字节数
+HOOK_PROBE_CAP = 64     # len 未知函数（大厅B）的启发式拷贝上限，防越界读
+
+# 发送函数族（cdecl，id 恒为 arg1；buf/len 位置已用调用方压栈序列逐一核实）：
+#   大厅 A 0x63C950 (id, 0, buf, len)    大厅 B 0x63CA00 (id, buf 或 0)
+#   战斗 A 0x63FBB0 (id, buf, len, 0, 0) 战斗 C 0x63FB40 (id, buf, len, 0, 0)
+# (rva, 名称, len_arg, buf_arg)：stub 从第几个参数取拷贝长度/包体指针；
+# len_arg=0 表示长度未知（大厅B），用 a3→a4 启发式并夹到 HOOK_PROBE_CAP。
+SEND_FUNCS = (
+    (0x63C950, "大厅A", 4, 3),
+    (0x63CA00, "大厅B", 0, 2),
+    (KILL_SEND_OFF, "战斗A", 3, 2),
+    (0x63FB40, "战斗C", 3, 2),
+)
+FN_NAMES = {rva: name for rva, name, _l, _b in SEND_FUNCS}
+MAIN_A_OFF = 0x63C950
+MAIN_B_OFF = 0x63CA00
+SEND_C_OFF = 0x63FB40
 
 _ONE_BYTE_OPS = (set(range(0x40, 0x50)) | set(range(0x50, 0x60)) |
                  {0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x27, 0x2F, 0x37, 0x3F,
@@ -872,7 +889,7 @@ _ONE_BYTE_OPS = (set(range(0x40, 0x50)) | set(range(0x50, 0x60)) |
                   0xA4, 0xA5, 0xA6, 0xA7, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
                   0xF5, 0xF8, 0xF9, 0xFC, 0xFD} |
                  set(range(0x6C, 0x70)) | {0xEC, 0xED, 0xEE, 0xEF})
-_RELATIVE_OPS = (set(range(0x70, 0x80)) | {0xE0, 0xE1, 0xE2, 0xE3, 0xE8, 0xE9, 0xEA,
+_RELATIVE_OPS = (set(range(0x70, 0x80)) | {0xE0, 0xE1, 0xE2, 0xE3, 0xEA,
                                            0xEB, 0xC3, 0xC2, 0xCB, 0xCC, 0xCD})
 
 
@@ -923,6 +940,8 @@ def instr_len32(buf):
         return None if extra is None else i + extra
     if op in _ONE_BYTE_OPS:
         return i
+    if op in (0xE8, 0xE9):
+        return i + 4                    # call/jmp rel32：5 字节，搬移后可重定位
     if op in _RELATIVE_OPS:
         return None
     if op == 0x68 or 0xB8 <= op <= 0xBF or op in (0xA1, 0xA3):
@@ -943,58 +962,107 @@ def instr_len32(buf):
     return None if extra is None else i + extra + imm
 
 
-def hook_stolen(raw):
-    """发包函数入口前若干字节 → 可整体搬移的前缀；序言不符/边界不定返回 None。
-    已知序言 55 8B EC 51（push ebp; mov ebp,esp; push ecx），其后那条指令
-    必须能整条搬走，跳回地址才是真实指令边界。"""
-    if not raw or len(raw) < 5 or bytes(raw[:4]) != b"\x55\x8B\xEC\x51":
+def hook_stolen(raw, send_addr):
+    """发包函数入口原始字节 → (可整体搬移的前缀, E8/E9 重定位表)。
+    逐条解码到 ≥5 字节（上限 16），保证跳回地址落在真实指令边界；范围内的
+    裸 E8/E9 相对转移记录 (偏移, 绝对目标) 交 hook_code 重定向（E9 thunk
+    入口即整条 E9）；jcc/ret 等搬移后语义会变的指令返回 None。"""
+    if not raw or len(raw) < HOOK_READ_BYTES:
         return None
-    n = instr_len32(bytes(raw[4:HOOK_READ_BYTES]))
-    if not n:
-        return None
-    return bytes(raw[:4 + n])
+    raw = bytes(raw[:HOOK_READ_BYTES])
+    n = 0
+    relocs = []
+    while n < 5:
+        ln = instr_len32(raw[n:])
+        if not ln:
+            return None
+        if raw[n] in (0xE8, 0xE9):
+            rel = struct.unpack_from("<i", raw, n + 1)[0]
+            relocs.append((n, (send_addr + n + 5 + rel) & 0xFFFFFFFF))
+        n += ln
+        if n > 16:
+            return None
+    return bytes(raw[:n]), tuple(relocs)
 
 
-def hook_code(code_base, data_base, send_addr, stolen):
-    """抓包钩子：记录 (id, buf, len) 到环形槽，执行被覆盖的原指令后跳回边界。
-    数据块：+0 计数器，+4 重放标记，+8 起 64×512 槽（id/len/marker/包体）。"""
+def hook_code(code_base, data_base, send_addr, stolen, relocs, len_arg, buf_arg):
+    """抓包钩子：记录 (id, a2, a3, a4) 与拷贝长度到环形槽，执行被覆盖的原指令
+    （E8/E9 已按新地址重定位）后跳回边界。len_arg=长度参数序号（0=启发式），
+    buf_arg=包体参数序号；buf 为 NULL 时只记槽头不拷贝。
+    数据块：+0 计数器，+4 重放标记，+8 起 64×1024 槽（头 24 字节 + 包体）。"""
     c = Code32()
-    c.bytes_((0x9C, 0x60))                          # pushfd/pushad：栈顶+40/44/48 = 前三参数
-    c.bytes_((0x8B, 0x44, 0x24, 0x28))              # mov eax, [esp+40] → id
-    c.bytes_((0x8B, 0x5C, 0x24, 0x2C))              # mov ebx, [esp+44] → buf
-    c.bytes_((0x8B, 0x4C, 0x24, 0x30))              # mov ecx, [esp+48] → len
-    c.bytes_((0x81, 0xF9))                          # cmp ecx, HOOK_SLOT_DATA
+    c.bytes_((0x9C, 0x60))                          # pushfd/pushad：参数在 [esp+40..]
+    c.bytes_((0x8B, 0x44, 0x24, 0x28))              # mov eax,[esp+40] → a1=id
+    c.bytes_((0x8B, 0x5C, 0x24, 0x2C))              # mov ebx,[esp+44] → a2
+    c.bytes_((0x8B, 0x4C, 0x24, 0x30))              # mov ecx,[esp+48] → a3
+    c.bytes_((0x8B, 0x54, 0x24, 0x34))              # mov edx,[esp+52] → a4
+    if len_arg == 3:
+        c.bytes_((0x8B, 0xE9))                      # mov ebp, a3
+    elif len_arg == 4:
+        c.bytes_((0x8B, 0xEA))                      # mov ebp, a4
+    else:                                           # 启发式：a3 合法用 a3，否则 a4
+        c.bytes_((0x8B, 0xE9))
+        c.bytes_((0x81, 0xFD))                      # cmp ebp, HOOK_PROBE_CAP
+        c.word(HOOK_PROBE_CAP)
+        c.bytes_((0x76, 0x02))                      # jbe +2
+        c.bytes_((0x33, 0xED))                      # xor ebp, ebp
+        c.bytes_((0x85, 0xED))                      # test ebp, ebp
+        c.bytes_((0x75, 0x0C))                      # jnz have（跳过 12 字节）
+        c.bytes_((0x8B, 0xEA))                      # mov ebp, a4
+        c.bytes_((0x81, 0xFD))
+        c.word(HOOK_PROBE_CAP)
+        c.bytes_((0x76, 0x02))
+        c.bytes_((0x33, 0xED))
+    c.bytes_((0x81, 0xFD))                          # cmp ebp, HOOK_SLOT_DATA
     c.word(HOOK_SLOT_DATA)
-    c.bytes_((0x76, 0x05))                          # jbe +5（跳过下面 5 字节赋值）
-    c.bytes_((0xB9,))                               # mov ecx, HOOK_SLOT_DATA
+    c.bytes_((0x76, 0x05))                          # jbe +5
+    c.bytes_((0xBD,))                               # mov ebp, HOOK_SLOT_DATA（夹到上限）
     c.word(HOOK_SLOT_DATA)
-    c.bytes_((0xBA, 0x01, 0x00, 0x00, 0x00))        # mov edx, 1
-    c.bytes_((0xF0, 0x0F, 0xC1, 0x15))              # lock xadd [计数器], edx → edx=旧值
+    if buf_arg == 3:
+        c.bytes_((0x85, 0xC9))                      # test ecx, ecx（buf=a3）
+    else:
+        c.bytes_((0x85, 0xDB))                      # test ebx, ebx（buf=a2）
+    c.bytes_((0x75, 0x02))                          # jnz +2
+    c.bytes_((0x33, 0xED))                          # buf 为 NULL → 长度清零
+    c.bytes_((0xBE, 0x01, 0x00, 0x00, 0x00))        # mov esi, 1
+    c.bytes_((0xF0, 0x0F, 0xC1, 0x35))              # lock xadd [计数器], esi → esi=旧值
     c.word(data_base + HOOK_CTR_OFF)
-    c.bytes_((0x83, 0xE2, 0x3F))                    # and edx, 63
-    c.bytes_((0xC1, 0xE2, 0x09))                    # shl edx, 9（×512）
-    c.bytes_((0x8D, 0x92))                          # lea edx, [edx+槽区]
+    c.bytes_((0x83, 0xE6, 0x3F))                    # and esi, 63
+    c.bytes_((0xC1, 0xE6, 0x0A))                    # shl esi, 10（×1024）
+    c.bytes_((0x81, 0xC6))                          # add esi, 槽区
     c.word(data_base + HOOK_SLOTS_OFF)
-    c.bytes_((0x89, 0x02))                          # mov [edx], eax → id
-    c.bytes_((0x89, 0x4A, 0x04))                    # mov [edx+4], ecx → len
-    c.bytes_((0x8B, 0x05))                          # mov eax, [重放标记]
+    c.bytes_((0x89, 0x06))                          # mov [esi], eax → id
+    c.bytes_((0x89, 0x6E, 0x04))                    # mov [esi+4], ebp → len
+    c.bytes_((0x89, 0x5E, 0x08))                    # mov [esi+8], ebx → a2
+    c.bytes_((0x89, 0x4E, 0x0C))                    # mov [esi+12], ecx → a3
+    c.bytes_((0x89, 0x56, 0x10))                    # mov [esi+16], edx → a4
+    c.bytes_((0xA1,))                               # mov eax, [重放标记]
     c.word(data_base + HOOK_MARKER_OFF)
-    c.bytes_((0x89, 0x42, 0x08))                    # mov [edx+8], eax → marker
+    c.bytes_((0x89, 0x46, 0x14))                    # mov [esi+20], eax → meta
     c.bytes_((0xFC,))                               # cld
-    c.bytes_((0x8D, 0x7A, 0x0C))                    # lea edi, [edx+12]
-    c.bytes_((0x8B, 0xF3))                          # mov esi, ebx
+    c.bytes_((0x8D, 0x7E, 0x18))                    # lea edi, [esi+24]
+    if buf_arg == 3:
+        c.bytes_((0x8B, 0xF1))                      # mov esi, ecx（源=a3）
+    else:
+        c.bytes_((0x8B, 0xF3))                      # mov esi, ebx（源=a2）
+    c.bytes_((0x8B, 0xCD))                          # mov ecx, ebp
     c.bytes_((0xF3, 0xA4))                          # rep movsb
     c.bytes_((0x61, 0x9D))                          # popad/popfd：与压栈 9C,60 严格逆序，
                                                     # 先弹 flags 会把 EDI 当 EFLAGS、把 EFLAGS 装进 ESP
     c.bytes_(tuple(stolen))                         # 被覆盖的原指令
+    base_pos = len(c.b) - len(stolen)
+    for off, target in relocs:                      # stolen 内 E8/E9 重定位到原目标
+        rel = (target - code_base - base_pos - off - 5) & 0xFFFFFFFF
+        struct.pack_into("<I", c.b, base_pos + off + 1, rel)
     c.bytes_((0xE9,))                               # jmp send+len(stolen)
     p = c.hole()
     c.rel(p, send_addr + len(stolen) - code_base)   # rel32 相对下一条指令，需扣除加载基址
     return bytes(c.b)
 
 
-def send_packet_code(code_base, data_base, send_addr, packet_id, payload, marker_addr):
-    """远程线程：置重放标记 → send(id, buf, len, 0, 0) → 清标记 → 写状态。
+def send_packet_code(code_base, data_base, fn_addr, pushes, marker_addr):
+    """远程线程：置重放标记 → 按 pushes 顺序压参调用 fn_addr（cdecl，序列中
+    "BUF" 替换为包体地址 data_base）→ 清标记 → 写状态。
     data_base+0 为包体，+128 为状态：1 成功 / 2 SEH 捕获异常。marker_addr=0 不写标记。"""
     c = Code32()
     status = data_base + 128
@@ -1006,13 +1074,10 @@ def send_packet_code(code_base, data_base, send_addr, packet_id, payload, marker
         c.bytes_((0xC7, 0x05))
         c.word(marker_addr)
         c.word(1)
-    c.push(0)
-    c.push(0)
-    c.push(len(payload))
-    c.push(data_base)
-    c.push(packet_id)
-    c.call(send_addr)
-    c.bytes_((0x83, 0xC4, 0x14))
+    for v in pushes:
+        c.push(data_base if v == "BUF" else v)
+    c.call(fn_addr)
+    c.bytes_((0x83, 0xC4, 4 * len(pushes)))
     if marker_addr:
         c.bytes_((0xC7, 0x05))
         c.word(marker_addr)
@@ -1060,7 +1125,7 @@ class PacketJob:
     def busy(self):
         return bool(self.thread)
 
-    def start(self, handle, send_addr, packet_id, payload, marker_addr=0):
+    def start(self, handle, fn_addr, pushes, payload, marker_addr=0):
         if self.thread:
             return False
         self.start_error = 0
@@ -1068,8 +1133,7 @@ class PacketJob:
         if not block:
             self.start_error = ctypes.get_last_error()
             return False
-        code = send_packet_code(block, block + 4096, send_addr, packet_id,
-                                 payload, marker_addr)
+        code = send_packet_code(block, block + 4096, fn_addr, pushes, marker_addr)
         got = ctypes.c_size_t(0)
         ok = len(code) <= 4096
         if ok:
@@ -1169,20 +1233,33 @@ def pe_sections(hdr):
 
 
 def parse_capture_slot(blob):
-    """512 字节槽 → 记录；len 超上限按上限截断（写入端已截断，双保险）。"""
-    packet_id, n, marker = struct.unpack_from("<III", blob, 0)
+    """1024 字节槽 → 记录；len 超上限按上限截断（写入端已截断，双保险）。"""
+    packet_id, n, a2, a3, a4, marker = struct.unpack_from("<6I", blob, 0)
     n = min(n, HOOK_SLOT_DATA)
-    return {"id": packet_id, "mine": bool(marker),
+    return {"id": packet_id, "a2": a2, "a3": a3, "a4": a4, "mine": bool(marker),
             "data": bytes(blob[HOOK_SLOT_HDR:HOOK_SLOT_HDR + n])}
 
 
 def packet_line(seq, rec):
-    """列表行文本：序号 时间 id 长度 来源 前八字节预览。"""
+    """列表行文本：序号 时间 id 长度 来源函数 收发 前八字节预览。"""
     data = rec["data"]
-    return "#%-4d %s id=%-6d len=%-4d [%s] %s%s" % (
+    return "#%-4d %s id=%-6d len=%-4d [%s|%s] %s%s" % (
         seq, rec.get("time", ""), rec["id"], len(data),
+        FN_NAMES.get(rec.get("fn", 0), "?"),
         "我发" if rec.get("mine") else "游戏",
         data[:8].hex(" ").upper(), "…" if len(data) > 8 else "")
+
+
+def replay_pushes(fn, packet_id, payload, a2=0, a3=0, a4=0):
+    """按来源函数的参数表构造压栈序列（cdecl 从右往左压）；"BUF" 由
+    send_packet_code 替换为包体地址。len 取捕获值（=包体长度）。
+    战斗族 (id,buf,len,0,0)；大厅A (id,0,buf,len)；大厅B (id,buf 或 0)。"""
+    buf = "BUF" if payload else a2
+    if fn in (KILL_SEND_OFF, SEND_C_OFF):
+        return (0, 0, len(payload), buf, packet_id)
+    if fn == MAIN_A_OFF:
+        return (len(payload), buf, a2, packet_id)
+    return (buf, packet_id)
 
 
 # ---- 自检：本进程合成内存，不注入任何代码 ----
@@ -1390,23 +1467,29 @@ def self_test():
     ok = ok and instr_len32(bytes.fromhex("83C408")) == 3          # add esp,8
     ok = ok and instr_len32(bytes.fromhex("F00FC11578563412")) == 8  # lock xadd [mem],edx
     ok = ok and instr_len32(bytes.fromhex("0F8F78563412")) is None  # jg rel32 拒绝
-    ok = ok and instr_len32(bytes.fromhex("E800000000")) is None    # call rel32 拒绝
+    ok = ok and instr_len32(bytes.fromhex("E800000000")) == 5      # call rel32 允许（重定位）
+    ok = ok and instr_len32(bytes.fromhex("E900000000")) == 5      # jmp rel32 允许（重定位）
+    ok = ok and instr_len32(bytes.fromhex("EB00")) is None          # jmp short 拒绝
     ok = ok and instr_len32(b"\xC3") is None                        # ret 拒绝
 
-    # 抓包入口搬移判定：序言 + 整条指令边界
-    ok = ok and hook_stolen(bytes.fromhex("558BEC5153")) == bytes.fromhex("558BEC5153")
-    ok = ok and hook_stolen(bytes.fromhex("558BEC518B4508C3")) == bytes.fromhex("558BEC518B4508")
-    ok = ok and hook_stolen(bytes.fromhex("558BEC51E9")) is None
-    ok = ok and hook_stolen(bytes.fromhex("558BEC51C3")) is None
-    ok = ok and hook_stolen(bytes.fromhex("558BEC51")) is None      # 字节不足
-    ok = ok and hook_stolen(bytes.fromhex("8B455C5356")) is None    # 序言不符
+    # 抓包入口搬移判定：整条指令边界 + E8/E9 重定位表
+    st = hook_stolen(bytes.fromhex("558BEC5153") + b"\x90" * 11, 0x40000000)
+    ok = ok and st[0] == bytes.fromhex("558BEC5153") and st[1] == ()
+    st = hook_stolen(bytes.fromhex("558BEC518B450C8945FC") + b"\x00" * 8, 0x40000000)
+    ok = ok and st[0] == bytes.fromhex("558BEC518B450C") and st[1] == ()  # 战斗A 真实序言
+    st = hook_stolen(bytes.fromhex("E927C84401") + b"\x90" * 11, 0x40000000 + 0x63C950)
+    ok = ok and st[0] == b"\xE9\x27\xC8\x44\x01" and st[1] == \
+        ((0, 0x40000000 + 0x63C950 + 5 + 0x0144C827),)              # E9 thunk 入口
+    ok = ok and hook_stolen(bytes.fromhex("558BEC51C3") + b"\x90" * 11, 0) is None
+    ok = ok and hook_stolen(bytes.fromhex("558BEC51EB05") + b"\x90" * 10, 0) is None
+    ok = ok and hook_stolen(bytes.fromhex("558BEC51"), 0) is None   # 字节不足
 
-    # 钩子代码：结构 + 跳回边界校验
+    # 钩子代码：结构 + 跳回边界校验（战斗A：len=a3 buf=a2）
     send_addr = 0x40000000 + 0x63FBB0
-    stolen = bytes.fromhex("558BEC5153")
-    hcode = hook_code(0x10000000, 0x10001000, send_addr, stolen)
+    stolen = bytes.fromhex("558BEC518B450C")
+    hcode = hook_code(0x10000000, 0x10001000, send_addr, stolen, (), 3, 2)
     ok = ok and len(hcode) <= 4096 and hcode[0] == 0x9C and hcode[1] == 0x60
-    ok = ok and b"\xF0\x0F\xC1\x15" + struct.pack("<I", 0x10001000) in hcode
+    ok = ok and b"\xF0\x0F\xC1\x35" + struct.pack("<I", 0x10001000) in hcode
     ok = ok and struct.pack("<I", 0x10001000 + HOOK_MARKER_OFF) in hcode
     ok = ok and struct.pack("<I", 0x10001000 + HOOK_SLOTS_OFF) in hcode
     ok = ok and hcode[len(hcode) - len(stolen) - 5:len(hcode) - 5] == stolen
@@ -1415,21 +1498,36 @@ def self_test():
     ok = ok and hcode[-5] == 0xE9
     rel = struct.unpack_from("<I", hcode, len(hcode) - 4)[0]
     ok = ok and 0x10000000 + len(hcode) + rel == send_addr + len(stolen)
+    # E9 thunk 重定位：stolen 里的 E9 改跳到原目标
+    thunk = 0x40000000 + 0x63C950
+    st2 = hook_stolen(bytes.fromhex("E927C84401") + b"\x90" * 11, thunk)
+    hcode2 = hook_code(0x10000000, 0x10001000, thunk, st2[0], st2[1], 4, 3)
+    p_stolen = len(hcode2) - len(st2[0]) - 5
+    rel2 = struct.unpack_from("<i", hcode2, p_stolen + 1)[0]
+    ok = ok and 0x10000000 + p_stolen + 5 + rel2 == st2[1][0][1]
 
-    # 重放代码：参数压栈顺序、状态写回、marker 可选
+    # 重放代码：参数压栈顺序（cdecl 从右往左）、状态写回、marker 可选
     payload = bytes(range(10))
-    scode = send_packet_code(0x20000000, 0x20001000, 0x40000000 + 0x63FBB0, 8121,
-                             payload, 0x20001000 + HOOK_MARKER_OFF)
+    pushes = replay_pushes(KILL_SEND_OFF, 8121, payload)
+    ok = ok and pushes == (0, 0, 10, "BUF", 8121)
+    scode = send_packet_code(0x20000000, 0x20001000, 0x40000000 + 0x63FBB0, pushes,
+                             0x20001000 + HOOK_MARKER_OFF)
     ok = ok and len(scode) <= 4096 and scode.rfind(b"\xC2\x04\x00") != -1 \
         and scode.rfind(b"\xC3") > scode.rfind(b"\xC2\x04\x00")   # 末尾是 SEH 处理器的 ret
     ok = ok and b"\x68" + struct.pack("<I", 8121) in scode
     ok = ok and b"\x68" + struct.pack("<I", 0x20001000) in scode
     ok = ok and b"\x68" + struct.pack("<I", len(payload)) in scode
+    ok = ok and b"\x83\xC4\x14" in scode                          # add esp,0x14（5 参）
     ok = ok and struct.pack("<I", 0x40000000 + 0x63FBB0) in scode
     ok = ok and struct.pack("<I", 0x20001000 + HOOK_MARKER_OFF) in scode
     ok = ok and struct.pack("<I", 0x20001000 + 128) in scode
-    plain = send_packet_code(0x20000000, 0x20001000, 0x40000000, 8121, payload, 0)
+    plain = send_packet_code(0x20000000, 0x20001000, 0x40000000,
+                             replay_pushes(KILL_SEND_OFF, 8121, payload), 0)
     ok = ok and struct.pack("<I", 0x20001000 + HOOK_MARKER_OFF) not in plain
+    # 大厅A/B 参数表
+    ok = ok and replay_pushes(MAIN_A_OFF, 6053, b"xyz", 0, 0x1234, 19) == (3, "BUF", 0, 6053)
+    ok = ok and replay_pushes(MAIN_B_OFF, 6001, b"") == (0, 6001)
+    ok = ok and replay_pushes(MAIN_B_OFF, 6001, b"q") == ("BUF", 6001)
 
     # hex 工具与过滤、槽解析
     ok = ok and parse_hex("55 8b ec") == b"\x55\x8b\xec"
@@ -1442,13 +1540,15 @@ def self_test():
     ok = ok and parse_filter_ids("8121, 0x1FB9 abc") == {8121}      # 0x1FB9=8121 去重
     ok = ok and parse_filter_ids("21900 08121") == {21900, 8121}    # 前导零按十进制
     slot = bytearray(HOOK_SLOT_SIZE)
-    struct.pack_into("<III", slot, 0, 8121, 3, 1)
+    struct.pack_into("<6I", slot, 0, 8121, 3, 0, 7, 9, 1)
     slot[HOOK_SLOT_HDR:HOOK_SLOT_HDR + 3] = b"\xAA\xBB\xCC"
     parsed = parse_capture_slot(bytes(slot))
-    ok = ok and parsed["id"] == 8121 and parsed["mine"] and parsed["data"] == b"\xAA\xBB\xCC"
+    ok = ok and parsed["id"] == 8121 and parsed["mine"] and parsed["data"] == b"\xAA\xBB\xCC" \
+        and parsed["a3"] == 7 and parsed["a4"] == 9
     empty = parse_capture_slot(bytes(HOOK_SLOT_SIZE))
     ok = ok and empty["data"] == b"" and not empty["mine"]
     ok = ok and packet_line(3, {"time": "12:00:00", "id": 8121, "mine": True,
+                                "fn": KILL_SEND_OFF,
                                 "data": b"\x55\x8B\xEC"}).startswith("#3")
 
     # PE 节表解析（导出代码段用）：合成 2 节头块
@@ -1687,9 +1787,12 @@ def run_ui():
             replaybox.pack(fill="x", padx=12, pady=(0, 4))
             self.capture_var = tk.BooleanVar(value=False)
             self.capture_filter = tk.StringVar(value="")
-            self.capture_block = 0
-            self.capture_orig = b""
-            self.capture_seen = 0
+            self.capture_hooks = []      # 已安装钩子 [(rva, name, block, orig, replay_addr)]
+            self.capture_seen = {}       # rva → 已读发包计数
+            self.edit_fn = KILL_SEND_OFF     # 编辑区当前包的来源函数与原始参数
+            self.edit_a2 = 0
+            self.edit_a3 = 0
+            self.edit_a4 = 0
             self.packets = []
             self.view = []               # 列表当前显示（过滤后）的记录
             self.send_job = PacketJob()
@@ -2197,24 +2300,20 @@ def run_ui():
                 self.replay_status.set("循环重放已就绪；发送失败或异常会自动停止。")
             self.save_settings()
 
-        def start_capture(self):
-            """发包函数入口写 E9 跳板：记录参数到环形槽后执行原指令并跳回边界。"""
-            def fail(msg):
-                self.capture_var.set(False)
-                self.replay_status.set(msg)
-
-            send_addr = self.base + KILL_SEND_OFF
-            if read_u32(self.handle, send_addr) != 0x51EC8B55:
-                return fail("抓包失败：发包函数序言不符（未知客户端），已自动取消勾选。")
+        def _install_hook(self, rva, name, len_arg, buf_arg):
+            """单函数入口写 E9 跳板；失败返回 None（不阻断其他函数）。"""
+            send_addr = self.base + rva
             raw = read_mem(self.handle, send_addr, HOOK_READ_BYTES)
-            stolen = hook_stolen(raw) if raw else None
-            if not stolen:
-                return fail("抓包失败：发包函数入口指令无法安全搬移，已自动取消勾选。")
-            block = k32.VirtualAllocEx(self.handle, None, 0xA000, MEM_COMMIT_RESERVE,
+            parsed = hook_stolen(raw, send_addr) if raw else None
+            if not parsed:
+                return None
+            stolen, relocs = parsed
+            block = k32.VirtualAllocEx(self.handle, None, 0x12000, MEM_COMMIT_RESERVE,
                                        PAGE_READWRITE) or 0
             if not block:
-                return fail("抓包失败：远程内存分配失败（错误码 %d）。" % ctypes.get_last_error())
-            code = hook_code(block, block + 0x1000, send_addr, stolen)
+                return None
+            code = hook_code(block, block + 0x1000, send_addr, stolen, relocs,
+                             len_arg, buf_arg)
             got = ctypes.c_size_t(0)
             ok = bool(k32.WriteProcessMemory(self.handle, ctypes.c_void_p(block), code,
                                              len(code), ctypes.byref(got))) \
@@ -2231,31 +2330,54 @@ def run_ui():
                 k32.FlushInstructionCache(self.handle, ctypes.c_void_p(send_addr), 5)
             if not ok:
                 k32.VirtualFreeEx(self.handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
-                return fail("抓包失败：钩子写入失败（错误码 %d），已自动取消勾选。"
-                            % ctypes.get_last_error())
-            self.capture_block, self.capture_orig, self.capture_seen = block, stolen, 0
-            self.replay_status.set("抓包已开启（%d 槽 × %d 字节）。之后本机发出的数据包都会进入列表。"
-                                   % (HOOK_SLOTS, HOOK_SLOT_DATA))
+                return None
+            replay_addr = send_addr
+            if stolen[:1] == b"\xE9" and relocs:
+                replay_addr = relocs[0][1]   # E9 thunk：重放直接调真身，绕开钩子
+            return [rva, name, block, stolen, replay_addr]
+
+        def start_capture(self):
+            """依次钩住全部发包函数；单个失败跳过，全失败才取消勾选。"""
+            self.capture_hooks = []
+            self.capture_seen = {}
+            skipped = []
+            for rva, name, len_arg, buf_arg in SEND_FUNCS:
+                hook = self._install_hook(rva, name, len_arg, buf_arg)
+                if hook:
+                    self.capture_hooks.append(hook)
+                else:
+                    skipped.append(name)
+            if not self.capture_hooks:
+                self.capture_var.set(False)
+                self.replay_status.set("抓包失败：发包函数入口无法安全搬移或内存错误"
+                                       "（未知客户端），已自动取消勾选。")
+                return
+            msg = "抓包已开启：%s（%d 槽 × %d 字节）。之后本机发出的数据包都会进入列表。" \
+                  % ("、".join(h[1] for h in self.capture_hooks), HOOK_SLOTS, HOOK_SLOT_DATA)
+            if skipped:
+                msg += "%s 未钩住（入口无法搬移）。" % "、".join(skipped)
+            self.replay_status.set(msg)
 
         def stop_capture(self):
-            if not self.capture_block:
-                return
-            block, orig = self.capture_block, self.capture_orig
-            self.capture_block, self.capture_orig, self.capture_seen = 0, b"", 0
-            if not self.handle or not orig:
+            hooks = self.capture_hooks
+            self.capture_hooks = []
+            self.capture_seen = {}
+            if not hooks or not self.handle:
                 return
             if k32.WaitForSingleObject(self.handle, 0) != WAIT_TIMEOUT:
                 return                      # 游戏已退出，钩子随进程消失
-            send_addr = self.base + KILL_SEND_OFF
-            jump = b"\xE9" + struct.pack("<I", (block - (send_addr + 5)) & 0xFFFFFFFF)
-            if read_mem(self.handle, send_addr, 5) != jump:
-                self.replay_status.set("发包函数入口与安装时不一致，钩子保留未卸载。")
-                return
-            got = ctypes.c_size_t(0)
-            if k32.WriteProcessMemory(self.handle, ctypes.c_void_p(send_addr), orig,
-                                      len(orig), ctypes.byref(got)):
-                k32.FlushInstructionCache(self.handle, ctypes.c_void_p(send_addr), len(orig))
-            k32.VirtualFreeEx(self.handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+            for rva, name, block, orig, _ra in hooks:
+                send_addr = self.base + rva
+                jump = b"\xE9" + struct.pack("<I", (block - (send_addr + 5)) & 0xFFFFFFFF)
+                if read_mem(self.handle, send_addr, 5) != jump:
+                    self.replay_status.set("%s 入口与安装时不一致，钩子保留未卸载。" % name)
+                    continue
+                got = ctypes.c_size_t(0)
+                if k32.WriteProcessMemory(self.handle, ctypes.c_void_p(send_addr), orig,
+                                          len(orig), ctypes.byref(got)):
+                    k32.FlushInstructionCache(self.handle, ctypes.c_void_p(send_addr),
+                                              len(orig))
+                k32.VirtualFreeEx(self.handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
             self.replay_status.set("抓包已关闭。")
 
         def capture_tick(self):
@@ -2264,25 +2386,29 @@ def run_ui():
                 return
             if not self.handle:
                 return
-            if not self.capture_block:
+            if not self.capture_hooks:
                 self.start_capture()
                 return
-            counter = read_u32(self.handle, self.capture_block + 0x1000 + HOOK_CTR_OFF)
-            if counter is None:
-                return
-            if counter - self.capture_seen > HOOK_SLOTS:
-                self.capture_seen = counter - HOOK_SLOTS
             fresh = []
-            for v in range(max(self.capture_seen, 0), counter):
-                slot = self.capture_block + 0x1000 + HOOK_SLOTS_OFF + (v & 63) * HOOK_SLOT_SIZE
-                blob = read_mem(self.handle, slot, HOOK_SLOT_SIZE)
-                if not blob:
+            for rva, name, block, _orig, _ra in self.capture_hooks:
+                seen = self.capture_seen.get(rva, 0)
+                counter = read_u32(self.handle, block + 0x1000 + HOOK_CTR_OFF)
+                if counter is None:
                     continue
-                rec = parse_capture_slot(blob)
-                if rec["data"]:
-                    rec["time"] = time.strftime("%H:%M:%S")
-                    fresh.append(rec)
-            self.capture_seen = max(self.capture_seen, counter)
+                if counter - seen > HOOK_SLOTS:
+                    seen = counter - HOOK_SLOTS
+                for v in range(max(seen, 0), counter):
+                    slot = block + 0x1000 + HOOK_SLOTS_OFF + \
+                        (v & (HOOK_SLOTS - 1)) * HOOK_SLOT_SIZE
+                    blob = read_mem(self.handle, slot, HOOK_SLOT_SIZE)
+                    if not blob:
+                        continue
+                    rec = parse_capture_slot(blob)
+                    if rec["data"] and not rec["mine"]:   # 重放回声（marker=1）不入列表
+                        rec["time"] = time.strftime("%H:%M:%S")
+                        rec["fn"] = rva
+                        fresh.append(rec)
+                self.capture_seen[rva] = max(seen, counter)
             if fresh:
                 self.packets.extend(fresh)
                 if len(self.packets) > 400:
@@ -2314,6 +2440,9 @@ def run_ui():
             if not path:
                 return
             dump = {"packets": [{"time": r["time"], "id": r["id"],
+                                 "fn": r.get("fn", KILL_SEND_OFF),
+                                 "a2": r.get("a2", 0), "a3": r.get("a3", 0),
+                                 "a4": r.get("a4", 0),
                                  "hex": r["data"].hex()} for r in self.packets]}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
@@ -2340,7 +2469,12 @@ def run_ui():
                     data = parse_hex(str(item["hex"]))
                     if data:
                         records.append({"time": str(item.get("time", "")),
-                                        "id": int(item["id"]), "mine": False, "data": data})
+                                        "id": int(item["id"]), "mine": False,
+                                        "fn": int(item.get("fn", KILL_SEND_OFF), 0) & 0xFFFFFFFF,
+                                        "a2": int(item.get("a2", 0), 0) & 0xFFFFFFFF,
+                                        "a3": int(item.get("a3", 0), 0) & 0xFFFFFFFF,
+                                        "a4": int(item.get("a4", 0), 0) & 0xFFFFFFFF,
+                                        "data": data})
                 except (KeyError, TypeError, ValueError):
                     continue
             self.packets = records
@@ -2399,11 +2533,16 @@ def run_ui():
                 self.replay_status.set("先在列表中选中一条记录。")
                 return
             rec = self.view[sel[0]]
+            self.edit_fn = rec.get("fn", KILL_SEND_OFF) & 0xFFFFFFFF
+            self.edit_a2 = rec.get("a2", 0) & 0xFFFFFFFF
+            self.edit_a3 = rec.get("a3", 0) & 0xFFFFFFFF
+            self.edit_a4 = rec.get("a4", 0) & 0xFFFFFFFF
             self.replay_id.set(str(rec["id"]))
             self.hex_box.delete("1.0", "end")
             self.hex_box.insert("1.0", rec["data"].hex(" ").upper())
-            self.replay_status.set("已载入 id=%d、%d 字节到编辑区；改完字节即可发送。"
-                                   % (rec["id"], len(rec["data"])))
+            self.replay_status.set("已载入 [%s] id=%d、%d 字节到编辑区；改完字节即可发送。"
+                                   % (FN_NAMES.get(self.edit_fn, "?"), rec["id"],
+                                      len(rec["data"])))
 
         def apply_hex_patch(self):
             parsed = self.payload_from_box()
@@ -2441,10 +2580,13 @@ def run_ui():
 
         def start_send(self, parsed):
             packet_id, payload = parsed
-            marker = self.capture_block + 0x1000 + HOOK_MARKER_OFF \
-                if self.capture_block else 0
-            if self.send_job.start(self.handle, self.base + KILL_SEND_OFF, packet_id,
-                                   payload, marker):
+            hook = next((h for h in self.capture_hooks if h[0] == self.edit_fn), None)
+            marker = hook[2] + 0x1000 + HOOK_MARKER_OFF if hook else 0
+            # 战斗族重放必经钩子入口（原函数体已覆盖）；大厅A/B 优先走 E9 真身绕开钩子
+            fn_addr = hook[4] if hook else self.base + self.edit_fn
+            pushes = replay_pushes(self.edit_fn, packet_id, payload,
+                                   self.edit_a2, self.edit_a3, self.edit_a4)
+            if self.send_job.start(self.handle, fn_addr, pushes, payload, marker):
                 return True
             self.replay_status.set("发送失败：远程线程创建失败（Win32 错误码 %d）。"
                                    % self.send_job.start_error)
