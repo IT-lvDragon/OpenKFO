@@ -1804,6 +1804,7 @@ def run_ui():
             self.replay_sent = 0
             self.batch_queue = []        # 连发序列待发记录
             self.batch_total = 0
+            self.settle_extras_var = tk.BooleanVar(value=False)  # 一键结算是否附带确认包
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
             ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
@@ -1849,6 +1850,8 @@ def run_ui():
                        command=self.send_batch).pack(side="left", padx=(8, 0))
             ttk.Button(srow, text="一键结算",
                        command=self.one_key_settle).pack(side="left", padx=(8, 0))
+            ttk.Checkbutton(srow, text="带确认包", variable=self.settle_extras_var
+                            ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="循环", variable=self.loop_var,
                             command=self.on_loop_toggle).pack(side="left", padx=(10, 0))
             ttk.Label(srow, text="间隔(ms):").pack(side="left", padx=(8, 2))
@@ -2639,8 +2642,9 @@ def run_ui():
 
         def one_key_settle(self):
             """一键结算：取最近握手包（8071/8291/8121）尾部的本局 token，替换进
-            最近一条 4110 模板（0x47/0x9E 两处），连同其后同一秒的确认包按序连发。
-            对局进行中可直接用；房间模拟整局时在握手连发后约 10 秒点本按钮。"""
+            最近一条 4110 模板（0x47/0x9E 两处）后只发这一条 4110。
+            实测旧局确认包（4115/2250/2251 等）在新对局重放会触发掉线，
+            默认不带；需要实验时勾选「带确认包」才连同其后同一秒的包连发。"""
             if not self.handle:
                 self.replay_status.set("请先选择进程并点「启动」。")
                 return
@@ -2673,16 +2677,18 @@ def run_ui():
                 return
             payload = tmpl["data"].replace(old, token)
             batch = [dict(tmpl, data=payload, a4=len(payload))]
-            for rec in self.packets[idx + 1:]:
-                if rec.get("time", "") != tmpl.get("time", "") or not rec["data"]:
-                    break
-                batch.append(rec)
-            del batch[32:]
+            if self.settle_extras_var.get():
+                for rec in self.packets[idx + 1:]:
+                    if rec.get("time", "") != tmpl.get("time", "") or not rec["data"]:
+                        break
+                    batch.append(rec)
+                del batch[32:]
             self.batch_queue = batch
             self.batch_total = len(batch)
             self.replay_status.set("一键结算排队 %d 个，token %s → %s%s。"
                                    % (len(batch), old.hex().upper(), token.hex().upper(),
-                                      "（未变）" if token == old else ""))
+                                      "（未变）" if token == old else
+                                      ("，含确认包" if len(batch) > 1 else "，仅 4110")))
 
         def send_once(self):
             if not self.handle:
