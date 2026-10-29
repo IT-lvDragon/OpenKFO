@@ -1616,7 +1616,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1029c（结算只用真实包）")
+            root.title("属性助手 · 单机版 v1029d（取token→发送一次）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -1841,6 +1841,8 @@ def run_ui():
             ttk.Entry(erow, textvariable=self.hex_replace, width=13).pack(side="left")
             ttk.Button(erow, text="应用替换",
                        command=self.apply_hex_patch).pack(side="left", padx=(8, 0))
+            ttk.Button(erow, text="取本局token",
+                       command=self.apply_local_token).pack(side="left", padx=(8, 0))
             self.hex_box = tk.Text(replaybox, height=4, wrap="char", font="TkFixedFont")
             self.hex_box.pack(fill="x", padx=8, pady=2)
             srow = ttk.Frame(replaybox)
@@ -2569,6 +2571,39 @@ def run_ui():
             self.hex_box.delete("1.0", "end")
             self.hex_box.insert("1.0", patched.hex(" ").upper())
             self.replay_status.set("已替换 %d 处，当前 %d 字节。" % (count, len(patched)))
+
+        def apply_local_token(self):
+            """把最近游戏握手包尾部的本局 token 替换进编辑区当前包体（0x47/0x9E），
+            用户确认字节后再点「发送一次」——与手动验证成功的路径完全同构。"""
+            parsed = self.payload_from_box()
+            if parsed is None:
+                return
+            payload = parsed[1]
+            token = None
+            for rec in reversed(self.packets):
+                if not rec.get("mine") and rec["id"] in (8071, 8291, 8121) \
+                        and len(rec["data"]) >= 8:
+                    token = rec["data"][-4:]
+                    break
+            if not token:
+                self.replay_status.set("列表里没有游戏发的握手包（8071/8291/8121），先进一局。")
+                return
+            if len(payload) < 0xA2:
+                self.replay_status.set("包体 %d 字节不足 162，不是 4110，无法替换 token。"
+                                       % len(payload))
+                return
+            old = payload[0x47:0x4B]
+            if payload[0x9E:0xA2] != old:
+                self.replay_status.set("0x47/0x9E 两处值不一致，不是标准 4110 模板。")
+                return
+            if old == token:
+                self.replay_status.set("token 已是本局（%s），无需替换。" % token.hex().upper())
+                return
+            patched = payload.replace(old, token)
+            self.hex_box.delete("1.0", "end")
+            self.hex_box.insert("1.0", patched.hex(" ").upper())
+            self.replay_status.set("token %s → %s 已替换进编辑区（2 处），确认后点「发送一次」。"
+                                   % (old.hex().upper(), token.hex().upper()))
 
         def payload_from_box(self):
             """编辑区内容 → (id, bytes)；非法时在状态栏提示并返回 None。"""
