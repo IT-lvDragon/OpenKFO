@@ -1616,7 +1616,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1029d（取token→发送一次）")
+            root.title("属性助手 · 单机版 v1030a（握手包尾部换token）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2588,14 +2588,20 @@ def run_ui():
             if not token:
                 self.replay_status.set("列表里没有游戏发的握手包（8071/8291/8121），先进一局。")
                 return
-            if len(payload) < 0xA2:
-                self.replay_status.set("包体 %d 字节不足 162，不是 4110，无法替换 token。"
-                                       % len(payload))
+            if len(payload) < 0xA2 or payload[0x47:0x4B] != payload[0x9E:0xA2]:
+                if len(payload) < 8:
+                    self.replay_status.set("包体太短，无法替换 token。")
+                    return
+                tail = payload[-4:]                 # 握手包：token 在尾部 4 字节
+                if tail == b"\x00\x00\x00\x00":
+                    self.replay_status.set("此包尾部无 token（全 0），无需替换，直接发送即可。")
+                    return
+                self.hex_box.delete("1.0", "end")
+                self.hex_box.insert("1.0", (payload[:-4] + token).hex(" ").upper())
+                self.replay_status.set("尾部 token %s → %s 已替换，确认后点「发送一次」。"
+                                       % (tail.hex().upper(), token.hex().upper()))
                 return
             old = payload[0x47:0x4B]
-            if payload[0x9E:0xA2] != old:
-                self.replay_status.set("0x47/0x9E 两处值不一致，不是标准 4110 模板。")
-                return
             if old == token:
                 self.replay_status.set("token 已是本局（%s），无需替换。" % token.hex().upper())
                 return
