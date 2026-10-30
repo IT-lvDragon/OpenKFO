@@ -14,6 +14,7 @@ import random
 import struct
 import sys
 import time
+import traceback
 from ctypes import wintypes
 
 # ---- 偏移常量（main.cpp / kill.h，gfxz.dat 1B7C8676 实测）----
@@ -1906,7 +1907,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1030i（下行抓包）")
+            root.title("属性助手 · 单机版 v1030j（循环异常隔离）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2325,6 +2326,11 @@ def run_ui():
             self.status.set(f"已启动{note}（基址 0x{base:08X}，模块查找："
                             f"{MODULE_LOOKUP_INFO or '未知'}；{probe}）。"
                             "沿用勾选设置，换局自动继续，无需重复连接。")
+            if self.capture_var.get():
+                # 连接后抓包一律改为手动开启：自动恢复会在连接瞬间直接装钩
+                # （含 recv 下行钩），历史版本疑似因此导致游戏异常、功能失效。
+                self.capture_var.set(False)
+                self.save_settings()
 
         def stop_clicked(self):
             self.stop()
@@ -2366,17 +2372,20 @@ def run_ui():
 
         # -- 周期执行 --
         def tick(self):
-            if self.handle:
-                if k32.WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0:
-                    self.actor = None  # 游戏已退出：不回写旧内存
-                    self.disconnect_pending = True
-                elif self.disconnect_pending and not self.kill_busy() \
-                        and not self.send_job.busy():
-                    self.disconnect_pending = False
-                    if self.stop(silent=True):
-                        self.status.set("游戏已退出，已停止所有操作；勾选保留。")
-                elif not self.disconnect_pending:
-                    self.enforce()
+            try:
+                if self.handle:
+                    if k32.WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0:
+                        self.actor = None  # 游戏已退出：不回写旧内存
+                        self.disconnect_pending = True
+                    elif self.disconnect_pending and not self.kill_busy() \
+                            and not self.send_job.busy():
+                        self.disconnect_pending = False
+                        if self.stop(silent=True):
+                            self.status.set("游戏已退出，已停止所有操作；勾选保留。")
+                    elif not self.disconnect_pending:
+                        self.enforce()
+            except Exception:
+                self.status.set("属性循环异常：" + traceback.format_exc().splitlines()[-1])
             self.root.after(100, self.tick)
 
         def enforce(self):
@@ -3361,15 +3370,29 @@ def run_ui():
                 self.start_kill()
 
         def auto_loop(self):
-            # 秒杀独立 30ms 循环（C++ 版为 20ms 定时器），不随属性 tick 变慢
+            # 秒杀独立 30ms 循环（C++ 版为 20ms 定时器），30ms 足够接近。
+            # 每个子循环独立捕获异常：单个异常不得中断整条 30ms 链
+            # （链一断，重放/移动/连点/清内存/抓包读取会全部静默停摆）。
             if self.handle:
-                self.auto_tick()
-            self.capture_tick()
-            self.replay_tick()
-            self.move_tick()
-            self.click_tick()
-            self.mem_tick()
+                try:
+                    self.auto_tick()
+                except Exception:
+                    self.loop_err("秒杀", traceback.format_exc())
+            for name, fn in (("抓包", self.capture_tick), ("重放", self.replay_tick),
+                             ("移动", self.move_tick), ("连点", self.click_tick),
+                             ("清内存", self.mem_tick)):
+                try:
+                    fn()
+                except Exception:
+                    self.loop_err(name, traceback.format_exc())
             self.root.after(30, self.auto_loop)
+
+        def loop_err(self, name, tb):
+            """子循环异常上报：状态栏显示末行原因；同因只报一次，避免刷屏。"""
+            msg = "%s循环异常：%s" % (name, tb.splitlines()[-1])
+            if msg != getattr(self, "_last_loop_err", None):
+                self._last_loop_err = msg
+                self.status.set(msg)
 
         def on_mem_toggle(self):
             self.mem_last_clean = now_ms()  # 勾选即重新计时
