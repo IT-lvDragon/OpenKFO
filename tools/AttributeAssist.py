@@ -169,6 +169,8 @@ def write_u32(handle, addr, value):
 # ---- 进程与模块 ----
 LAST_SNAP_ERROR = ""
 
+MODULE_LOOKUP_INFO = ""     # module_base_named 最近一次查找过程诊断
+
 
 def find_processes():
     """枚举 gfxz.dat / gfld.dat 进程，返回 [(pid, name)]。"""
@@ -233,25 +235,76 @@ def module_base(pid):
     return base
 
 
-def module_base_named(pid, name):
-    """枚举进程模块找指定 DLL 的加载基址（小写比较）；找不到返回 0。"""
-    if not k32.Module32NextW:
-        return 0
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) or 0
-    if not snap:
-        return 0
-    entry = MODULEENTRY32W()
-    entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+def module_base_named(pid, name, handle=0):
+    """枚举进程模块找指定 DLL 的加载基址（小写比较）；找不到返回 0。
+    先 toolhelp（Module32First/NextW），失败/没找到再用 EnumProcessModulesEx
+    的 32 位模块列表兜底；过程诊断写入 MODULE_LOOKUP_INFO。"""
+    global MODULE_LOOKUP_INFO
+    MODULE_LOOKUP_INFO = ""
     base = 0
-    if k32.Module32FirstW(snap, ctypes.byref(entry)):
-        while True:
-            if (entry.szModule or "").lower() == name.lower():
-                base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
-                break
-            if not k32.Module32NextW(snap, ctypes.byref(entry)):
-                break
-    k32.CloseHandle(snap)
-    return base
+    count = 0
+    if k32.Module32NextW:
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) or 0
+        if snap:
+            entry = MODULEENTRY32W()
+            entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+            if k32.Module32FirstW(snap, ctypes.byref(entry)):
+                while True:
+                    count += 1
+                    if (entry.szModule or "").lower() == name.lower():
+                        base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
+                        break
+                    if not k32.Module32NextW(snap, ctypes.byref(entry)):
+                        break
+            else:
+                MODULE_LOOKUP_INFO = "toolhelp首模块失败(err=%d)" % ctypes.get_last_error()
+            k32.CloseHandle(snap)
+        else:
+            MODULE_LOOKUP_INFO = "toolhelp快照失败(err=%d)" % ctypes.get_last_error()
+        if base:
+            MODULE_LOOKUP_INFO = "toolhelp=%d" % count
+            return base
+    if not handle:
+        MODULE_LOOKUP_INFO += " 未找到(%d模块)" % count
+        return 0
+    MODULE_LOOKUP_INFO += " toolhelp=%d模块" % count
+    enum = _enum_modules32_base(handle, name)
+    if enum:
+        MODULE_LOOKUP_INFO += " enum32命中"
+        return enum
+    return 0
+
+
+def _enum_modules32_base(handle, name):
+    """EnumProcessModulesEx(LIST_MODULES_32BIT) 兜底：64 位工具进程枚举 WOW64
+    目标的模块列表；诊断追加进 MODULE_LOOKUP_INFO，找不到返回 0。"""
+    fn_enum = getattr(k32, "K32EnumProcessModulesEx", None)
+    fn_name = getattr(k32, "K32GetModuleBaseNameW", None)
+    if fn_enum is None or fn_name is None:
+        try:
+            psapi = ctypes.WinDLL("psapi.dll", use_last_error=True)
+            fn_enum = psapi.EnumProcessModulesEx
+            fn_name = psapi.GetModuleBaseNameW
+        except OSError:
+            MODULE_LOOKUP_INFO += " psapi不可用"
+            return 0
+    fn_enum.argtypes = [_handle, ctypes.POINTER(_handle), wintypes.DWORD,
+                        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+    fn_enum.restype = wintypes.BOOL
+    fn_name.argtypes = [_handle, _handle, ctypes.c_wchar_p, wintypes.DWORD]
+    fn_name.restype = wintypes.DWORD
+    mods = (_handle * 1024)()
+    need = wintypes.DWORD(0)
+    if not fn_enum(handle, mods, ctypes.sizeof(mods), ctypes.byref(need), 0x01):
+        MODULE_LOOKUP_INFO += " enum32失败(err=%d)" % ctypes.get_last_error()
+        return 0
+    n = min(1024, need.value // ctypes.sizeof(_handle))
+    MODULE_LOOKUP_INFO += " enum32=%d模块" % n
+    buf = ctypes.create_unicode_buffer(260)
+    for i in range(n):
+        if fn_name(handle, mods[i], buf, 260) and buf.value.lower() == name.lower():
+            return mods[i] or 0
+    return 0
 
 
 def resolve_export(handle, base, name):
@@ -1734,6 +1787,7 @@ def self_test():
     tcode = recv_hook_code(0x30000000, 0x30001000, 0x71000000, b"", 0)  # E9 thunk 变体
     ok = ok and tcode[0] == 0x60 and b"\xB8" + struct.pack("<I", 0x71000000) in tcode \
         and tcode[-3:] == b"\xC2\x10\x00"
+    module_base_named(0, "ws2_32.dll")   # 任意结果皆可：路径不崩、诊断有值（wine 会命中自身）
 
     # hex 工具与过滤、槽解析
     ok = ok and parse_hex("55 8b ec") == b"\x55\x8b\xec"
@@ -2561,9 +2615,9 @@ def run_ui():
         def _install_recv_hook(self):
             """钩 ws2_32.recv 抓服务器下行；失败原因写入 recv_hook_err（不阻断）。"""
             self.recv_hook_err = ""
-            wbase = module_base_named(self.pid, "ws2_32.dll")
+            wbase = module_base_named(self.pid, "ws2_32.dll", self.handle)
             if not wbase:
-                self.recv_hook_err = "ws2_32.dll 未找到"
+                self.recv_hook_err = "ws2_32.dll 未找到（%s）" % MODULE_LOOKUP_INFO
                 return None
             rva = resolve_export(self.handle, wbase, "recv")
             if not rva:
