@@ -1906,7 +1906,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1030f（下行抓包）")
+            root.title("属性助手 · 单机版 v1030g（基址回退+失败原因）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
