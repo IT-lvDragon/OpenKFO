@@ -1148,6 +1148,8 @@ def recv_prologue_delta(stolen):
             pass
         elif 0x50 <= op <= 0x57 and op != 0x54:              # push r32（不含 esp）
             delta -= 4
+        elif op in (0x6A, 0x68):                             # push imm8/imm32
+            delta -= 4
         elif op == 0x83 and raw[n + 1] == 0xEC:              # sub esp,imm8
             delta -= raw[n + 2]
         elif op == 0x81 and raw[n + 1] == 0xEC:              # sub esp,imm32
@@ -1187,18 +1189,20 @@ def _code32_mov_esi_esp_mem(c, off):
         c.word(off)
 
 
-def recv_hook_code(code_base, data_base, recv_addr, stolen, esp_delta):
-    """recv 下行钩子 stub：原始栈执行 stolen（被覆盖的序言）→ pushad → 垫参
-    call recv_addr+len(stolen)（stdcall 自清 4 参）→ 返回值 >0 时把 buf 内容
-    拷进环形槽（id=0xFFFFFFFF、meta=2 标识下行）→ 恢复调用者 ebp/esp 后 ret 16。
+def recv_hook_code(code_base, data_base, body_addr, stolen, esp_delta):
+    """recv 下行钩子 stub：原始栈执行 stolen（被覆盖的序言；入口是 E9 thunk 时
+    stolen 为空、body_addr=真身入口）→ pushad → 垫参 call body_addr（stdcall
+    自清 4 参）→ 返回值 >0 时把 buf 内容拷进环形槽（id=0xFFFFFFFF、meta=2
+    标识下行）→ 恢复调用者 ebp/esp 后 ret 16。
     数据块布局与发送钩子一致（+0 计数器 / +4 重放标记 / +8 起 64×1024 槽）。"""
     c = Code32()
-    c.b += bytes(stolen)                            # 原始栈上执行序言（esp = E + esp_delta）
+    if stolen:
+        c.b += bytes(stolen)                            # 原始栈上执行序言（esp = E + esp_delta）
     c.bytes_((0x60,))                               # pushad → esp = E + esp_delta - 32
     base_off = 32 - esp_delta                       # 调用者返回地址相对当前 esp 的偏移
     for _ in range(4):                              # 压 flags/len/buf/s（stdcall 从右往左）；
         _code32_push_esp_mem(c, base_off + 16)      # 每次压栈后 esp-4，取参偏移同步 +4 → 恒定
-    c.call(recv_addr + len(stolen))                 # 真 recv 主体；返回后 eax=接收字节数
+    c.call(body_addr)                               # 真 recv 主体；返回后 eax=接收字节数
     c.bytes_((0x85, 0xC0, 0x7E))                    # test eax,eax / jle done
     jle_pos = c.hole()
     c.bytes_((0xBB, 0x01, 0x00, 0x00, 0x00))        # mov ebx,1
@@ -1718,13 +1722,18 @@ def self_test():
     ok = ok and recv_prologue_delta(b"\x8B\xFF") is None               # 不足 5 字节
     ok = ok and recv_prologue_delta(b"\xE8\x00\x00\x00\x00\x90") is None   # call 拒绝
     ok = ok and recv_prologue_delta(b"\x54\x55\x56\x57\x8B\xEC") is None   # push esp 拒绝
-    rcode = recv_hook_code(0x30000000, 0x30001000, 0x71000000,
+    ok = ok and recv_prologue_delta(b"\x6A\x01\x55\x8B\xEC") == -8      # push imm8
+    ok = ok and recv_prologue_delta(b"\x68\x01\x02\x03\x04") == -4      # push imm32
+    rcode = recv_hook_code(0x30000000, 0x30001000, 0x71000005,
                            b"\x8B\xFF\x55\x8B\xEC", -4)
     ok = ok and b"\xB8" + struct.pack("<I", 0x71000005) in rcode       # call recv+5
     ok = ok and struct.pack("<I", 0x30001000 + HOOK_CTR_OFF) in rcode
     ok = ok and struct.pack("<I", 0x30001000 + HOOK_SLOTS_OFF) in rcode
     ok = ok and b"\x8B\x74\x24\x2C" in rcode                           # mov esi,[esp+44]=buf
     ok = ok and rcode[-3:] == b"\xC2\x10\x00"                          # ret 16
+    tcode = recv_hook_code(0x30000000, 0x30001000, 0x71000000, b"", 0)  # E9 thunk 变体
+    ok = ok and tcode[0] == 0x60 and b"\xB8" + struct.pack("<I", 0x71000000) in tcode \
+        and tcode[-3:] == b"\xC2\x10\x00"
 
     # hex 工具与过滤、槽解析
     ok = ok and parse_hex("55 8b ec") == b"\x55\x8b\xec"
@@ -1988,6 +1997,7 @@ def run_ui():
             self.capture_seen = {}       # rva → 已读发包计数
             self.recv_hook = None        # recv 下行钩子 [addr, name, block, orig]
             self.recv_seen = 0
+            self.recv_hook_err = ""
             self.edit_fn = KILL_SEND_OFF     # 编辑区当前包的来源函数与原始参数
             self.edit_a2 = 0
             self.edit_a3 = 0
@@ -2549,29 +2559,41 @@ def run_ui():
             return [rva, name, block, stolen, replay_addr]
 
         def _install_recv_hook(self):
-            """钩 ws2_32.recv 抓服务器下行；序言非白名单或解析失败返回 None（不阻断）。"""
+            """钩 ws2_32.recv 抓服务器下行；失败原因写入 recv_hook_err（不阻断）。"""
+            self.recv_hook_err = ""
             wbase = module_base_named(self.pid, "ws2_32.dll")
             if not wbase:
+                self.recv_hook_err = "ws2_32.dll 未找到"
                 return None
             rva = resolve_export(self.handle, wbase, "recv")
             if not rva:
+                self.recv_hook_err = "recv 导出解析失败（ws2_32@%08X）" % wbase
                 return None
             recv_addr = wbase + rva
             raw = read_mem(self.handle, recv_addr, HOOK_READ_BYTES)
             parsed = hook_stolen(raw, recv_addr) if raw else None
             if not parsed:
+                self.recv_hook_err = "入口不可搬移：%s" % (raw or b"").hex(" ")
                 return None
             stolen, relocs = parsed
-            if relocs:
-                return None                     # 序言含 E8/E9 跳转，stub 无法安全重建
-            esp_delta = recv_prologue_delta(stolen)
-            if esp_delta is None:
+            if len(relocs) == 1 and relocs[0][0] == 0 and len(stolen) == 5 \
+                    and stolen[0] == 0xE9:
+                body, st, esp_delta = relocs[0][1], b"", 0     # 入口=E9 thunk → 直调真身
+            elif relocs:
+                self.recv_hook_err = "入口含 E8/E9：%s" % raw.hex(" ")
                 return None
+            else:
+                esp_delta = recv_prologue_delta(stolen)
+                if esp_delta is None:
+                    self.recv_hook_err = "序言非白名单：%s" % stolen.hex(" ")
+                    return None
+                body, st = recv_addr + len(stolen), stolen
             block = k32.VirtualAllocEx(self.handle, None, 0x12000, MEM_COMMIT_RESERVE,
                                        PAGE_READWRITE) or 0
             if not block:
+                self.recv_hook_err = "远程内存分配失败"
                 return None
-            code = recv_hook_code(block, block + 0x1000, recv_addr, stolen, esp_delta)
+            code = recv_hook_code(block, block + 0x1000, body, st, esp_delta)
             got = ctypes.c_size_t(0)
             ok = bool(k32.WriteProcessMemory(self.handle, ctypes.c_void_p(block), code,
                                              len(code), ctypes.byref(got))) \
@@ -2625,7 +2647,8 @@ def run_ui():
                 msg += "%s 未钩住（入口无法搬移）。" % "、".join(skipped)
             self.recv_hook = self._install_recv_hook()
             self.recv_seen = 0
-            msg += "下行 recv 已钩。" if self.recv_hook else "（recv 未钩：序言非标准，仅上行抓包）"
+            msg += "下行 recv 已钩。" if self.recv_hook \
+                else "（recv 未钩：%s；仅上行抓包）" % (self.recv_hook_err or "未知原因")
             self.replay_status.set(msg)
 
         def stop_capture(self):
