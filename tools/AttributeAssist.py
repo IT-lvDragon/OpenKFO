@@ -1906,7 +1906,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1030g（基址回退+失败原因）")
+            root.title("属性助手 · 单机版 v1030h（连接自检）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2316,8 +2316,15 @@ def run_ui():
             self.handle, self.base, self.actor = handle, base, None
             self.pid = pid
             self.auto_fault = False
+            # 基址自检：立刻试读两个全局指针，判断偏移是否仍有效
+            def ptr_str(v):
+                return "不可读✗" if v is None else ("0（空）" if v == 0 else "0x%08X ✓" % v)
+            mgr = read_u32(handle, base + MANAGER_PTR)
+            inf = read_u32(handle, base + INFO_PTR)
+            probe = "自检：管理器=%s 信息=%s" % (ptr_str(mgr), ptr_str(inf))
             self.status.set(f"已启动{note}（基址 0x{base:08X}，模块查找："
-                            f"{MODULE_LOOKUP_INFO or '未知'}）。沿用勾选设置，换局自动继续，无需重复连接。")
+                            f"{MODULE_LOOKUP_INFO or '未知'}；{probe}）。"
+                            "沿用勾选设置，换局自动继续，无需重复连接。")
 
         def stop_clicked(self):
             self.stop()
