@@ -223,19 +223,12 @@ def file_sha256(path):
 
 
 def module_base(pid):
-    """主模块（游戏 exe）基址：优先 EnumProcessModulesEx 的 32 位模块列表
-    （exe 恒为首个，64 位工具枚举 WOW64 目标最可靠），toolhelp 兜底；
-    都失败返回 0（由调用方 BASE_FALLBACK 兜底）。诊断写入 MODULE_LOOKUP_INFO。"""
+    """主模块（游戏 exe）基址：toolhelp 模块快照取首模块（旧行为，实测可用）；
+    失败返回 0，由调用方 BASE_FALLBACK(0x400000) 兜底。EnumProcessModulesEx
+    仅作诊断对比写入 MODULE_LOOKUP_INFO（不采用其返回值：用户机器实测该
+    路径返回错误基址，采用后所有偏移失效）。"""
     global MODULE_LOOKUP_INFO
-    MODULE_LOOKUP_INFO = ""
     base = 0
-    handle = k32.OpenProcess(PROCESS_RIGHTS, False, pid) or 0
-    if handle:
-        base = _enum_modules32(handle, "")
-        k32.CloseHandle(handle)
-    if base:
-        MODULE_LOOKUP_INFO = "enum32"
-        return base
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) or 0
     if snap:
         entry = MODULEENTRY32W()
@@ -243,7 +236,13 @@ def module_base(pid):
         if k32.Module32FirstW(snap, ctypes.byref(entry)):
             base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
         k32.CloseHandle(snap)
-    MODULE_LOOKUP_INFO = "enum32失败 " + ("toolhelp" if base else "toolhelp失败")
+    info = "toolhelp=0x%08X" % base if base else "toolhelp失败(err=%d)" % ctypes.get_last_error()
+    handle = k32.OpenProcess(PROCESS_RIGHTS, False, pid) or 0
+    if handle:
+        ebase = _enum_modules32(handle, "")
+        k32.CloseHandle(handle)
+        info += " enum32=0x%08X" % ebase if ebase else " enum32无"
+    MODULE_LOOKUP_INFO = info
     return base
 
 
@@ -2083,6 +2082,7 @@ def run_ui():
             self.recv_hook = None        # recv 下行钩子 [addr, name, block, orig]
             self.recv_seen = 0
             self.recv_hook_err = ""
+            self.send_hook_err = {}      # 上行 send 钩失败原因（name → 原因）
             self.edit_fn = KILL_SEND_OFF     # 编辑区当前包的来源函数与原始参数
             self.edit_a2 = 0
             self.edit_a3 = 0
@@ -2609,16 +2609,19 @@ def run_ui():
             self.save_settings()
 
         def _install_hook(self, rva, name, len_arg, buf_arg):
-            """单函数入口写 E9 跳板；失败返回 None（不阻断其他函数）。"""
+            """单函数入口写 E9 跳板；失败返回 None（原因记入 self.send_hook_err，不阻断其他函数）。"""
             send_addr = self.base + rva
             raw = read_mem(self.handle, send_addr, HOOK_READ_BYTES)
             parsed = hook_stolen(raw, send_addr) if raw else None
             if not parsed:
+                self.send_hook_err[name] = ("入口不可读" if not raw
+                                            else "序言不可搬移:%s" % bytes(raw[:12]).hex(" "))
                 return None
             stolen, relocs = parsed
             block = k32.VirtualAllocEx(self.handle, None, 0x12000, MEM_COMMIT_RESERVE,
                                        PAGE_READWRITE) or 0
             if not block:
+                self.send_hook_err[name] = "VirtualAllocEx 失败(err=%d)" % ctypes.get_last_error()
                 return None
             code = hook_code(block, block + 0x1000, send_addr, stolen, relocs,
                              len_arg, buf_arg)
@@ -2638,6 +2641,7 @@ def run_ui():
                 k32.FlushInstructionCache(self.handle, ctypes.c_void_p(send_addr), 5)
             if not ok:
                 k32.VirtualFreeEx(self.handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+                self.send_hook_err[name] = "写内存/改保护失败(err=%d)" % ctypes.get_last_error()
                 return None
             replay_addr = send_addr
             if stolen[:1] == b"\xE9" and relocs:
@@ -2715,6 +2719,7 @@ def run_ui():
             """依次钩住全部发包函数；单个失败跳过，全失败才取消勾选。"""
             self.capture_hooks = []
             self.capture_seen = {}
+            self.send_hook_err = {}
             skipped = []
             for rva, name, len_arg, buf_arg in SEND_FUNCS:
                 hook = self._install_hook(rva, name, len_arg, buf_arg)
@@ -2724,8 +2729,9 @@ def run_ui():
                     skipped.append(name)
             if not self.capture_hooks:
                 self.capture_var.set(False)
-                self.replay_status.set("抓包失败：发包函数入口无法安全搬移或内存错误"
-                                       "（未知客户端），已自动取消勾选。")
+                detail = "；".join("%s:%s" % (n, self.send_hook_err.get(n, "未知"))
+                                   for n in skipped) or "未知"
+                self.replay_status.set("抓包失败：全部发包函数未钩住（%s）。已自动取消勾选。" % detail)
                 return
             msg = "抓包已开启：%s（%d 槽 × %d 字节）。之后本机发出的数据包都会进入列表。" \
                   % ("、".join(h[1] for h in self.capture_hooks), HOOK_SLOTS, HOOK_SLOT_DATA)
@@ -2751,8 +2757,7 @@ def run_ui():
             if recv_hook:
                 self._uninstall_entry_hook(*recv_hook)
             if not hooks:
-                self.replay_status.set("抓包已关闭。")
-                return
+                return    # 全失败后的取消勾选：保留「抓包失败」原因，不覆盖
             for rva, name, block, orig, _ra in hooks:
                 send_addr = self.base + rva
                 jump = b"\xE9" + struct.pack("<I", (block - (send_addr + 5)) & 0xFFFFFFFF)
