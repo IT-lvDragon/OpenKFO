@@ -223,15 +223,27 @@ def file_sha256(path):
 
 
 def module_base(pid):
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) or 0
-    if not snap:
-        return 0
-    entry = MODULEENTRY32W()
-    entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+    """主模块（游戏 exe）基址：优先 EnumProcessModulesEx 的 32 位模块列表
+    （exe 恒为首个，64 位工具枚举 WOW64 目标最可靠），toolhelp 兜底；
+    都失败返回 0（由调用方 BASE_FALLBACK 兜底）。诊断写入 MODULE_LOOKUP_INFO。"""
+    global MODULE_LOOKUP_INFO
+    MODULE_LOOKUP_INFO = ""
     base = 0
-    if k32.Module32FirstW(snap, ctypes.byref(entry)):
-        base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
-    k32.CloseHandle(snap)
+    handle = k32.OpenProcess(PROCESS_RIGHTS, False, pid) or 0
+    if handle:
+        base = _enum_modules32(handle, "")
+        k32.CloseHandle(handle)
+    if base:
+        MODULE_LOOKUP_INFO = "enum32"
+        return base
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) or 0
+    if snap:
+        entry = MODULEENTRY32W()
+        entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+        if k32.Module32FirstW(snap, ctypes.byref(entry)):
+            base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
+        k32.CloseHandle(snap)
+    MODULE_LOOKUP_INFO = "enum32失败 " + ("toolhelp" if base else "toolhelp失败")
     return base
 
 
@@ -275,9 +287,9 @@ def module_base_named(pid, name, handle=0):
     return 0
 
 
-def _enum_modules32_base(handle, name):
-    """EnumProcessModulesEx(LIST_MODULES_32BIT) 兜底：64 位工具进程枚举 WOW64
-    目标的模块列表；诊断追加进 MODULE_LOOKUP_INFO，找不到返回 0。"""
+def _enum32_fns():
+    """EnumProcessModulesEx/GetModuleBaseNameW 函数对：kernel32 的 K32 前缀导出
+    优先（Win7+），缺失时回落 psapi.dll；都不可用返回 (None, None)。"""
     fn_enum = getattr(k32, "K32EnumProcessModulesEx", None)
     fn_name = getattr(k32, "K32GetModuleBaseNameW", None)
     if fn_enum is None or fn_name is None:
@@ -286,8 +298,18 @@ def _enum_modules32_base(handle, name):
             fn_enum = psapi.EnumProcessModulesEx
             fn_name = psapi.GetModuleBaseNameW
         except OSError:
-            MODULE_LOOKUP_INFO += " psapi不可用"
-            return 0
+            return None, None
+    return fn_enum, fn_name
+
+
+def _enum_modules32(handle, name):
+    """EnumProcessModulesEx(LIST_MODULES_32BIT) 枚举目标 32 位模块：
+    name 为空返回首个模块（即 exe）基址，否则按名称（小写）匹配。
+    诊断追加进 MODULE_LOOKUP_INFO；找不到返回 0。"""
+    fn_enum, fn_name = _enum32_fns()
+    if fn_enum is None:
+        MODULE_LOOKUP_INFO += " psapi不可用"
+        return 0
     fn_enum.argtypes = [_handle, ctypes.POINTER(_handle), wintypes.DWORD,
                         ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
     fn_enum.restype = wintypes.BOOL
@@ -302,9 +324,18 @@ def _enum_modules32_base(handle, name):
     MODULE_LOOKUP_INFO += " enum32=%d模块" % n
     buf = ctypes.create_unicode_buffer(260)
     for i in range(n):
-        if fn_name(handle, mods[i], buf, 260) and buf.value.lower() == name.lower():
-            return mods[i] or 0
+        if name:
+            if fn_name(handle, mods[i], buf, 260) and buf.value.lower() == name.lower():
+                return mods[i] or 0
+        elif mods[i]:
+            return mods[i]
     return 0
+
+
+def _enum_modules32_base(handle, name):
+    """EnumProcessModulesEx(仅 32 位模块) 兜底：64 位工具进程枚举 WOW64
+    目标的模块列表；诊断追加进 MODULE_LOOKUP_INFO，找不到返回 0。"""
+    return _enum_modules32(handle, name)
 
 
 def resolve_export(handle, base, name):
@@ -2285,7 +2316,8 @@ def run_ui():
             self.handle, self.base, self.actor = handle, base, None
             self.pid = pid
             self.auto_fault = False
-            self.status.set(f"已启动{note}。沿用勾选设置，换局自动继续，无需重复连接。")
+            self.status.set(f"已启动{note}（基址 0x{base:08X}，模块查找："
+                            f"{MODULE_LOOKUP_INFO or '未知'}）。沿用勾选设置，换局自动继续，无需重复连接。")
 
         def stop_clicked(self):
             self.stop()
