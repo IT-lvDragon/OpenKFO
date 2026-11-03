@@ -1738,7 +1738,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1033（操作序列）")
+            root.title("属性助手 · 单机版 v1034（结算优化）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -1953,6 +1953,8 @@ def run_ui():
             self.settle_extras_var = tk.BooleanVar(value=False)  # 一键结算是否附带确认包
             self.settle_auto_var = tk.BooleanVar(value=False)    # 直接结算自动模式
             self.settle_last_token = None                        # 上次直接结算已发的 token
+            self.settle_tmpl_cache = None                        # 锁定的 4110 模板副本
+            self.settle_last_ts = 0                              # 上次直接结算时间戳(冷却)
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
             ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
@@ -2004,6 +2006,8 @@ def run_ui():
                        command=self.one_key_win).pack(side="left", padx=(8, 0))
             ttk.Button(srow, text="直接结算",
                        command=self.direct_settle).pack(side="left", padx=(8, 0))
+            ttk.Button(srow, text="刷新模板",
+                       command=self.settle_reset_tmpl).pack(side="left", padx=(8, 0))
             ttk.Checkbutton(srow, text="自动结算", variable=self.settle_auto_var
                             ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="带确认包", variable=self.settle_extras_var
@@ -3078,11 +3082,24 @@ def run_ui():
             return None
 
         def settle_tmpl(self):
-            """最新一条游戏发的 4110 模板（≥0x4B 字节，含 token 主位）。"""
-            return next((r for r in reversed(self.packets)
-                         if not r.get("mine") and r["id"] == 4110
-                         and len(r["data"]) >= SETTLE_TOKEN_OFF + SETTLE_TOKEN_LEN),
-                        None)
+            """4110 模板：优先用已锁定的缓存；否则取列表里**第一条**游戏发的
+            4110（≥0x4B 字节）锁定缓存。实测最新的 4110 可能是失败重试或
+            结算后变体（自动模式因此偶发失效），第一条原始模板长期有效；
+            缓存为独立副本，抓包列表裁剪不影响。"""
+            if self.settle_tmpl_cache:
+                return self.settle_tmpl_cache
+            for r in self.packets:
+                if not r.get("mine") and r["id"] == 4110 \
+                        and len(r["data"]) >= SETTLE_TOKEN_OFF + SETTLE_TOKEN_LEN:
+                    self.settle_tmpl_cache = dict(r, data=bytes(r["data"]))
+                    return self.settle_tmpl_cache
+            return None
+
+        def settle_reset_tmpl(self):
+            """丢弃模板缓存：下一次直接结算取列表里新的第一条 4110。"""
+            self.settle_tmpl_cache = None
+            self.settle_last_token = None
+            self.replay_status.set("直接结算模板已重置：将取列表里新的一条 4110 锁定。")
 
         def settle_send_with(self, tmpl, token):
             """按模板参数发送换好 token 的 4110，成功返回 True。"""
@@ -3090,11 +3107,11 @@ def run_ui():
             if payload is None:
                 self.replay_status.set("直接结算：4110 模板过短，无法替换 token。")
                 return False
-            idx = next((i for i, r in enumerate(self.packets) if r is tmpl), -1) + 1
             ok = self.start_send_rec(dict(tmpl, data=payload, a4=len(payload)))
             if ok:
-                self.replay_status.set("直接结算已发送：token %s → %s（模板 4110 #%d）。"
-                                       % (old.hex().upper(), token.hex().upper(), idx))
+                self.replay_status.set("直接结算已发送：token %s → %s（模板 4110，%d 字节）。"
+                                       % (old.hex().upper(), token.hex().upper(),
+                                          len(tmpl["data"])))
             else:
                 self.replay_status.set("直接结算发送失败：远程线程创建失败（错误码 %d）。"
                                        % self.send_job.start_error)
@@ -3124,7 +3141,7 @@ def run_ui():
 
         def settle_auto_tick(self):
             """自动直接结算：监视最新 8071(75B) 尾 8 字节，变化即自动重发 4110
-            （模板未就绪时等待，不记 token，模板到位后下一 tick 自动补发）。"""
+            （1.5 秒冷却防连发；模板未就绪时等待，模板到位后下一 tick 补发）。"""
             if not self.settle_auto_var.get() or not self.handle:
                 return
             if self.send_job.busy() or self.batch_queue or self.loop_var.get():
@@ -3132,11 +3149,14 @@ def run_ui():
             token = self.settle_token()
             if token is None or token == self.settle_last_token:
                 return
+            if now_ms() - self.settle_last_ts < 1500:   # 冷却：防状态机连冲
+                return
             tmpl = self.settle_tmpl()
             if tmpl is None:
                 return
             self.settle_send_with(tmpl, token)
             self.settle_last_token = token   # 发过（无论成败）才记，防重复轰炸
+            self.settle_last_ts = now_ms()
 
         def send_once(self):
             if not self.handle:
