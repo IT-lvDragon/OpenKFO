@@ -570,6 +570,71 @@ def parse_pixels(text, default=0):
     return max(0, min(value, 2000))
 
 
+# ---- 操作序列：点击/按键组合的前台模拟 ----
+KEY_VK_NAMES = {
+    "enter": 0x0D, "return": 0x0D, "回车": 0x0D,
+    "esc": 0x1B, "escape": 0x1B, "space": 0x20, "空格": 0x20,
+    "tab": 0x09, "shift": 0x10, "ctrl": 0x11, "control": 0x11, "alt": 0x12,
+    "up": 0x26, "上": 0x26, "down": 0x28, "下": 0x28,
+    "left": 0x25, "左": 0x25, "right": 0x27, "右": 0x27,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "ins": 0x2D,
+    "backspace": 0x08, "bs": 0x08,
+}
+
+
+def key_name_to_vk(name):
+    """键名 → 虚拟键码：F1-F24、常用命名键（KEY_VK_NAMES）、单个字母/数字；
+    其他单字符走 VkKeyScanW 兜底；无效返回 None。"""
+    s = str(name).strip().lower()
+    if not s:
+        return None
+    if s[0] == "f" and len(s) >= 2 and s[1:].isdigit() and 1 <= int(s[1:]) <= 24:
+        return 0x70 + int(s[1:]) - 1
+    if s in KEY_VK_NAMES:
+        return KEY_VK_NAMES[s]
+    if len(s) == 1:
+        ch = s.upper()
+        if "0" <= ch <= "9" or "A" <= ch <= "Z":
+            return ord(ch)
+        try:
+            r = user32().VkKeyScanW(ch)
+            if r != -1:
+                return r & 0xFF
+        except Exception:
+            pass
+    return None
+
+
+def parse_action_line(line):
+    """一行操作 → ('click',x,y) / ('key',vk) / ('wait',ms)；无效行返回 None。
+    语法（前缀大小写不敏感，全半角逗号均可）：点/click/c X,Y；
+    键/key/k 名称；等/wait/w 毫秒；# 开头为注释。"""
+    s = str(line).strip()
+    if not s or s.startswith("#"):
+        return None
+    parts = s.replace("，", " ").replace(",", " ").split()
+    head = parts[0].lower()
+    if head in ("点", "click", "c"):
+        if len(parts) >= 3:
+            try:
+                return ("click", int(float(parts[1])), int(float(parts[2])))
+            except ValueError:
+                return None
+        return None
+    if head in ("键", "key", "k"):
+        vk = key_name_to_vk(parts[1]) if len(parts) >= 2 else None
+        return ("key", vk) if vk else None
+    if head in ("等", "wait", "w"):
+        if len(parts) >= 2:
+            try:
+                return ("wait", max(0, min(int(float(parts[1])), 600000)))
+            except ValueError:
+                return None
+        return None
+    return None
+
+
 _psapi = None
 
 
@@ -1347,6 +1412,23 @@ def self_test():
     ok = ok and okv and bits == 0x4479C000  # 999.0f
     ok = ok and not feature_desired("1000", rage)[1]
     ok = ok and not feature_desired("-1", rage)[1]
+
+    # 操作序列解析
+    ok = ok and parse_action_line("点 100,200") == ("click", 100, 200) \
+        and parse_action_line("click 10, 20") == ("click", 10, 20) \
+        and parse_action_line("c 1，2") == ("click", 1, 2) \
+        and parse_action_line("键 F5") == ("key", 0x74) \
+        and parse_action_line("key Enter") == ("key", 0x0D) \
+        and parse_action_line("k a") == ("key", 0x41) \
+        and parse_action_line("等 500") == ("wait", 500) \
+        and parse_action_line("wait 0") == ("wait", 0) \
+        and parse_action_line("# 注释") is None \
+        and parse_action_line("点 100") is None \
+        and parse_action_line("键 F99") is None \
+        and parse_action_line("") is None
+    ok = ok and key_name_to_vk("F1") == 0x70 and key_name_to_vk("esc") == 0x1B \
+        and key_name_to_vk("9") == 0x39 and key_name_to_vk("w") == 0x57 \
+        and key_name_to_vk("空格") == 0x20 and key_name_to_vk("") is None
     ok = ok and not feature_desired("abc", rage)[1]
     inv = Feature(FEATURES[1])
     ok = ok and feature_desired("任意", inv) == (1, True)
@@ -1656,7 +1738,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1032（直接结算）")
+            root.title("属性助手 · 单机版 v1033（操作序列）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -1822,6 +1904,26 @@ def run_ui():
             ttk.Label(clickbox, textvariable=self.click_status, wraplength=520,
                       justify="left").grid(row=1, column=0, columnspan=7,
                                            sticky="w", padx=8, pady=(0, 6))
+            seqbox = ttk.LabelFrame(root, text="操作序列（点击/按键组合，前台模拟）")
+            seqbox.pack(fill="x", padx=12, pady=(0, 4))
+            self.seq_text = tk.Text(seqbox, height=4, width=34, font="TkFixedFont")
+            self.seq_text.grid(row=0, column=0, rowspan=2, padx=6, pady=4, sticky="ns")
+            ttk.Button(seqbox, text="执行序列",
+                       command=self.seq_run).grid(row=0, column=1, padx=4, sticky="w")
+            ttk.Button(seqbox, text="停止",
+                       command=self.seq_stop).grid(row=0, column=2, padx=4, sticky="w")
+            ttk.Button(seqbox, text="拾取追加(3秒)",
+                       command=self.seq_pick).grid(row=0, column=3, padx=4, sticky="w")
+            ttk.Checkbutton(seqbox, text="循环序列", variable=self.seq_loop_var,
+                            command=self.seq_kick).grid(row=1, column=1, sticky="w")
+            ttk.Label(seqbox, text="间隔(毫秒):").grid(row=1, column=2, sticky="e")
+            ttk.Entry(seqbox, textvariable=self.seq_interval, width=7).grid(
+                row=1, column=3, padx=(2, 4), sticky="w")
+            self.seq_status = tk.StringVar(
+                value="每行一条：点 X,Y（屏幕坐标）／键 名称（如 F5、Enter）／等 毫秒；# 注释。")
+            ttk.Label(seqbox, textvariable=self.seq_status, wraplength=520,
+                      justify="left").grid(row=2, column=0, columnspan=4,
+                                           sticky="w", padx=8, pady=(0, 4))
 
             replaybox = ttk.LabelFrame(root, text="结算重放（抓包 → 改字节 → 原生重发；风险自负）")
             replaybox.pack(fill="x", padx=12, pady=(0, 4))
@@ -1847,6 +1949,10 @@ def run_ui():
             self.settle_extras_var = tk.BooleanVar(value=False)  # 一键结算是否附带确认包
             self.settle_auto_var = tk.BooleanVar(value=False)    # 直接结算自动模式
             self.settle_last_token = None                        # 上次直接结算已发的 token
+            self.seq_loop_var = tk.BooleanVar(value=False)       # 操作序列循环执行
+            self.seq_interval = tk.StringVar(value="1000")       # 序列循环间隔（毫秒）
+            self.seq_busy = False                                # 序列 after 链执行中
+            self.seq_after_id = 0
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
             ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
@@ -1974,6 +2080,10 @@ def run_ui():
             self.loop_interval.set(str(data.get("loop_interval", "1000")))
             self.loop_count.set(str(data.get("loop_count", "0")))
             self.replay_id.set(str(data.get("replay_id", "8121")))
+            self.seq_text.delete("1.0", "end")
+            self.seq_text.insert("1.0", str(data.get("seq_text", "")))
+            self.seq_loop_var.set(bool(data.get("seq_loop", False)))
+            self.seq_interval.set(str(data.get("seq_interval", "1000")))
 
         def save_settings(self):
             path = settings_path()
@@ -2002,7 +2112,10 @@ def run_ui():
                     "capture_filter": self.capture_filter.get(),
                     "loop_interval": self.loop_interval.get(),
                     "loop_count": self.loop_count.get(),
-                    "replay_id": self.replay_id.get()}
+                    "replay_id": self.replay_id.get(),
+                    "seq_text": self.seq_text.get("1.0", "end").rstrip("\n"),
+                    "seq_loop": self.seq_loop_var.get(),
+                    "seq_interval": self.seq_interval.get()}
             try:
                 with open(path, "w", encoding="utf-8") as fp:
                     json.dump(data, fp, ensure_ascii=False, indent=1)
@@ -2343,6 +2456,102 @@ def run_ui():
                     x, y, "（范围 %d 随机）" % radius if radius else "", self.click_count))
             else:
                 self.click_status.set("点击注入失败（错误码 %d）。" % ctypes.get_last_error())
+
+        # -- 操作序列：点 A → 点 B / 键 K，逐条 after 链执行 --
+        def seq_interval_ms(self):
+            try:
+                return max(50, min(int(float(self.seq_interval.get())), 600000))
+            except ValueError:
+                return 1000
+
+        def seq_pick(self):
+            """3 秒后把鼠标当前位置追加为序列新一行「点 x,y」。"""
+            self.seq_status.set("3 秒后把鼠标当前位置追加到序列，请立即移到目标点…")
+
+            def grab():
+                pt = wintypes.POINT()
+                if user32().GetCursorPos(ctypes.byref(pt)):
+                    self.seq_text.insert("end", "\n点 %d,%d" % (pt.x, pt.y))
+                    self.seq_status.set("已追加 (点 %d, %d)。" % (pt.x, pt.y))
+                    self.save_settings()
+                else:
+                    self.seq_status.set("拾取失败，请重试。")
+            self.root.after(3000, grab)
+
+        def seq_stop(self):
+            if self.seq_busy and self.seq_after_id:
+                try:
+                    self.root.after_cancel(self.seq_after_id)
+                except Exception:
+                    pass
+            self.seq_busy = False
+            self.seq_after_id = 0
+            self.seq_status.set("序列已停止。")
+
+        def seq_kick(self):
+            self.save_settings()
+            if self.seq_loop_var.get() and not self.seq_busy:
+                self.seq_run()
+
+        def seq_run(self):
+            if self.seq_busy:
+                self.seq_status.set("序列执行中…（可点「停止」中止）")
+                return
+            acts = []
+            for ln in self.seq_text.get("1.0", "end").splitlines():
+                a = parse_action_line(ln)
+                if a:
+                    acts.append(a)
+            if not acts:
+                self.seq_status.set("序列为空或没有有效行（每行：点 X,Y / 键 名称 / 等 毫秒）。")
+                return
+            self.seq_busy = True
+            self.seq_status.set("开始执行序列（%d 步）…" % len(acts))
+            self._seq_step(acts, 0)
+
+        def _seq_pause(self, why):
+            """前台检查失败：循环模式按间隔重试整轮，否则终止。"""
+            self.seq_busy = False
+            self.seq_after_id = 0
+            if self.seq_loop_var.get() and self.handle:
+                self.seq_status.set(why + "；%d 毫秒后重试本轮。" % self.seq_interval_ms())
+                self.seq_after_id = self.root.after(self.seq_interval_ms(), self.seq_run)
+            else:
+                self.seq_status.set(why + "。")
+
+        def _seq_step(self, acts, idx):
+            if idx >= len(acts):
+                self.seq_busy = False
+                self.seq_after_id = 0
+                if self.seq_loop_var.get() and self.handle:
+                    wait = self.seq_interval_ms()
+                    self.seq_status.set("序列完成，%d 毫秒后开始下一轮。" % wait)
+                    self.seq_after_id = self.root.after(wait, self.seq_run)
+                else:
+                    self.seq_status.set("序列执行完成。")
+                return
+            self.seq_status.set("序列 %d/%d：%s" % (idx + 1, len(acts), acts[idx][0]))
+            act = acts[idx]
+            if act[0] == "wait":
+                self.seq_after_id = self.root.after(
+                    act[1], lambda: self._seq_step(acts, idx + 1))
+                return
+            if not self.handle or not game_foreground(self.pid):
+                self._seq_pause("游戏窗口不在前台或未连接游戏")
+                return
+            if act[0] == "click":
+                send_mouse_click(act[1], act[2], self.click_button.get())
+                self.seq_after_id = self.root.after(
+                    80, lambda: self._seq_step(acts, idx + 1))
+            elif act[0] == "key":
+                hwnd = find_main_window(self.pid)
+                if not hwnd:
+                    self._seq_pause("未找到游戏窗口")
+                    return
+                send_move_key(hwnd, act[1], True)
+                self.seq_after_id = self.root.after(60, lambda: (
+                    send_move_key(hwnd, act[1], False),
+                    self.root.after(60, lambda: self._seq_step(acts, idx + 1))))
 
         # -- 结算重放：抓包 + 改字节 + 原生重发 --
         def on_capture_toggle(self):
