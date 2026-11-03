@@ -1495,6 +1495,29 @@ def pe_sections(hdr):
     return out
 
 
+SETTLE_TOKEN_OFF = 0x43               # 4110 模板内嵌 8 字节本局 token 的偏移
+SETTLE_TOKEN_LEN = 8
+
+
+def make_settle_payload(tmpl_data, token8):
+    """直接结算包体：模板偏移 0x43-0x4A 换成最新 8071(75B) 尾部 8 字节 token；
+    再把模板旧 token 的后 4 字节全局替换为新 token 后 4 字节（兼容旧版
+    0x47/0x9E 双写格式；旧值为全零时跳过全局替换防止误伤零填充区）。
+    返回 (新包体, 旧token8)；模板过短返回 (None, b"")。"""
+    tmpl_data = bytes(tmpl_data)
+    token8 = bytes(token8)
+    if len(tmpl_data) < SETTLE_TOKEN_OFF + SETTLE_TOKEN_LEN:
+        return None, b""
+    old = tmpl_data[SETTLE_TOKEN_OFF:SETTLE_TOKEN_OFF + SETTLE_TOKEN_LEN]
+    payload = bytearray(tmpl_data)
+    payload[SETTLE_TOKEN_OFF:SETTLE_TOKEN_OFF + SETTLE_TOKEN_LEN] = token8
+    out = bytes(payload)
+    old4 = old[4:]
+    if any(old4) and old4 != token8[4:]:    # 旧后 4 字节全零时跳过（防误伤零填充区）
+        out = out.replace(old4, token8[4:])
+    return out, old
+
+
 def parse_capture_slot(blob):
     """1024 字节槽 → 记录；len 超上限按上限截断（写入端已截断，双保险）。
     marker 语义：0=游戏发送，1=工具重放回声，2=recv 下行（id=0xFFFFFFFF）。"""
@@ -1860,6 +1883,23 @@ def self_test():
     ok = ok and parse_ms("0", 500) == 0 and parse_ms("-3", 500) == 0
     ok = ok and parse_ms("abc", 500) == 500 and parse_ms("99999999", 500) == 3600000
 
+    # 直接结算包体构造：token8 主位替换 + 旧 0x47/0x9E 双写兼容 + 零填充保护
+    old8 = bytes.fromhex("08DD32E78D728714")
+    new8 = bytes.fromhex("1122334455667788")
+    stm = bytearray(0xB0)
+    stm[0x41:0x43] = b"\x01\x00"
+    stm[0x43:0x4B] = old8
+    stm[0x9E:0xA2] = old8[4:]                       # 旧版双写：token 后 4 字节
+    sp, sold = make_settle_payload(bytes(stm), new8)
+    ok = ok and sold == old8 and sp[0x43:0x4B] == new8 and sp[0x9E:0xA2] == new8[4:] \
+        and sp[:0x43] == bytes(stm[:0x43]) and sp[0xA2:] == bytes(stm[0xA2:])
+    stm2 = bytearray(0xB0)
+    stm2[0x41:0x43] = b"\x01\x00"                   # 旧 token 全零：只换主位
+    sp2, sold2 = make_settle_payload(bytes(stm2), new8)
+    ok = ok and sold2 == b"\x00" * 8 and sp2[0x43:0x4B] == new8 \
+        and sp2[:0x43] == bytes(stm2[:0x43]) and sp2[0x4B:] == bytes(stm2[0x4B:])
+    ok = ok and make_settle_payload(b"\x00" * 4, new8)[0] is None   # 模板过短
+
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 2
@@ -1907,7 +1947,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1030j（循环异常隔离）")
+            root.title("属性助手 · 单机版 v1031（直接结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2100,6 +2140,8 @@ def run_ui():
             self.batch_queue = []        # 连发序列待发记录
             self.batch_total = 0
             self.settle_extras_var = tk.BooleanVar(value=False)  # 一键结算是否附带确认包
+            self.settle_auto_var = tk.BooleanVar(value=False)    # 直接结算自动模式
+            self.settle_last_token = None                        # 上次直接结算已发的 token
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
             ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
@@ -2149,6 +2191,10 @@ def run_ui():
                        command=self.one_key_settle).pack(side="left", padx=(8, 0))
             ttk.Button(srow, text="一键胜利",
                        command=self.one_key_win).pack(side="left", padx=(8, 0))
+            ttk.Button(srow, text="直接结算",
+                       command=self.direct_settle).pack(side="left", padx=(8, 0))
+            ttk.Checkbutton(srow, text="自动结算", variable=self.settle_auto_var
+                            ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="带确认包", variable=self.settle_extras_var
                             ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="循环", variable=self.loop_var,
@@ -3229,6 +3275,75 @@ def run_ui():
                                    % (i94 + 1, old94.hex().upper(), token.hex().upper(),
                                       i4110 + 1, old.hex().upper(), token.hex().upper()))
 
+        def settle_token(self):
+            """最新一条游戏发的 8071(75B) 尾部 8 字节 = 本局进图 token。"""
+            for rec in reversed(self.packets):
+                if not rec.get("mine") and rec["id"] == 8071 \
+                        and len(rec["data"]) == 75:
+                    return bytes(rec["data"][-8:])
+            return None
+
+        def settle_tmpl(self):
+            """最新一条游戏发的 4110 模板（≥0x4B 字节，含 token 主位）。"""
+            return next((r for r in reversed(self.packets)
+                         if not r.get("mine") and r["id"] == 4110
+                         and len(r["data"]) >= SETTLE_TOKEN_OFF + SETTLE_TOKEN_LEN),
+                        None)
+
+        def settle_send_with(self, tmpl, token):
+            """按模板参数发送换好 token 的 4110，成功返回 True。"""
+            payload, old = make_settle_payload(tmpl["data"], token)
+            if payload is None:
+                self.replay_status.set("直接结算：4110 模板过短，无法替换 token。")
+                return False
+            idx = next((i for i, r in enumerate(self.packets) if r is tmpl), -1) + 1
+            ok = self.start_send_rec(dict(tmpl, data=payload, a4=len(payload)))
+            if ok:
+                self.replay_status.set("直接结算已发送：token %s → %s（模板 4110 #%d）。"
+                                       % (old.hex().upper(), token.hex().upper(), idx))
+            else:
+                self.replay_status.set("直接结算发送失败：远程线程创建失败（错误码 %d）。"
+                                       % self.send_job.start_error)
+            return ok
+
+        def direct_settle(self):
+            """直接结算：取最新 8071(75B) 尾 8 字节 token，替换进最新 4110
+            模板（0x43-0x4A）后原样重发，实现进图即结算过关奖励。"""
+            if not self.handle:
+                self.replay_status.set("请先选择进程并点「启动」。")
+                return
+            if self.send_job.busy() or self.batch_queue:
+                self.replay_status.set("发送进行中，请稍候。")
+                return
+            if self.loop_var.get():
+                self.replay_status.set("循环重放进行中，请先关闭。")
+                return
+            token = self.settle_token()
+            if token is None:
+                self.replay_status.set("直接结算：列表里没有 8071(75B)，先开抓包进图。")
+                return
+            tmpl = self.settle_tmpl()
+            if tmpl is None:
+                self.replay_status.set("直接结算：列表里没有 4110 模板，先正常结算一局。")
+                return
+            self.settle_send_with(tmpl, token)
+
+        def settle_auto_tick(self):
+            """自动直接结算：监视最新 8071(75B) 尾 8 字节，变化即自动重发 4110
+            （模板未就绪时等待，不记 token，模板到位后下一 tick 自动补发）。"""
+            if not self.settle_auto_var.get() or not self.handle:
+                return
+            if self.send_job.busy() or self.batch_queue or self.loop_var.get():
+                return
+            token = self.settle_token()
+            if token is None or token == self.settle_last_token:
+                return
+            tmpl = self.settle_tmpl()
+            if tmpl is None:
+                return
+            self.settle_send_with(tmpl, token)
+            self.settle_last_token = token   # 发过（无论成败）才记，防重复轰炸
+
         def send_once(self):
             if not self.handle:
                 self.replay_status.set("请先选择进程并点「启动」。")
@@ -3379,6 +3494,7 @@ def run_ui():
                 except Exception:
                     self.loop_err("秒杀", traceback.format_exc())
             for name, fn in (("抓包", self.capture_tick), ("重放", self.replay_tick),
+                             ("直接结算", self.settle_auto_tick),
                              ("移动", self.move_tick), ("连点", self.click_tick),
                              ("清内存", self.mem_tick)):
                 try:
