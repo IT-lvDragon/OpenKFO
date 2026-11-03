@@ -1880,6 +1880,10 @@ def run_ui():
             self.click_count = 0
             self.click_hwnd = 0
             self.pick_after_id = 0
+            self.seq_loop_var = tk.BooleanVar(value=False)   # 序列循环
+            self.seq_interval = tk.StringVar(value="1000")   # 序列轮间隔(毫秒)
+            self.seq_busy = False                            # 序列执行中
+            self.seq_after_id = 0                            # 序列 after 链句柄
             self.pid = 0
             ttk.Checkbutton(clickbox, text="自动点击",
                             variable=self.click_var,
@@ -1949,10 +1953,6 @@ def run_ui():
             self.settle_extras_var = tk.BooleanVar(value=False)  # 一键结算是否附带确认包
             self.settle_auto_var = tk.BooleanVar(value=False)    # 直接结算自动模式
             self.settle_last_token = None                        # 上次直接结算已发的 token
-            self.seq_loop_var = tk.BooleanVar(value=False)       # 操作序列循环执行
-            self.seq_interval = tk.StringVar(value="1000")       # 序列循环间隔（毫秒）
-            self.seq_busy = False                                # 序列 after 链执行中
-            self.seq_after_id = 0
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
             ttk.Checkbutton(crow, text="开启抓包", variable=self.capture_var,
