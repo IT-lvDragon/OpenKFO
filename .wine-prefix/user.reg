@@ -637,8 +637,8 @@ WINE REGISTRY Version 2
 [Software\\Wine\\FileOpenAssociations] 1794630070
 #time=1dd73ef93ae6412
 
-[Software\\Wine\\Fonts] 1794644094
-#time=1dd74103afb9bf2
+[Software\\Wine\\Fonts] 1794646549
+#time=1dd7415f1e02644
 "Codepages"="1252,437"
 "LogPixels"=dword:00000060
 
