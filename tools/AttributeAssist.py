@@ -13,6 +13,7 @@ import os
 import random
 import struct
 import sys
+import threading
 import time
 from collections import Counter
 from ctypes import wintypes
@@ -1776,7 +1777,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1037（原生结算）")
+            root.title("属性助手 · 单机版 v1038（自动原生结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -1990,6 +1991,12 @@ def run_ui():
             self.batch_total = 0
             self.settle_extras_var = tk.BooleanVar(value=False)  # 一键结算是否附带确认包
             self.settle_auto_var = tk.BooleanVar(value=False)    # 直接结算自动模式
+            self.native_auto_var = tk.BooleanVar(value=False)    # 自动原生结算（新版客户端）
+            self.native_seen_battle = False                      # 本局是否已见过战斗管理器非空
+            self.native_enter_ts = 0                             # 管理器首次非空时间（进图延迟计时）
+            self.native_last_ts = 0                              # 上次自动原生结算时间
+            self.native_busy = False                             # 原生结算后台线程进行中
+            self.native_msg = None                               # 后台线程完成后待上屏的消息
             self.settle_last_token = None                        # 上次直接结算已发的 token
             self.settle_tmpl_cache = None                        # 锁定的 4110 模板副本
             self.settle_tmpl_var = tk.StringVar(value="")        # 模板下拉框当前选择
@@ -2060,6 +2067,8 @@ def run_ui():
             ttk.Button(trow, text="原生结算",
                        command=self.native_settle).pack(side="left", padx=(8, 0))
             ttk.Checkbutton(srow, text="自动结算", variable=self.settle_auto_var
+                            ).pack(side="left", padx=(10, 0))
+            ttk.Checkbutton(srow, text="自动原生结算", variable=self.native_auto_var
                             ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="带确认包", variable=self.settle_extras_var
                             ).pack(side="left", padx=(10, 0))
@@ -3203,25 +3212,19 @@ def run_ui():
             self.replay_status.set("直接结算模板已重置：选回列表第一条 4110"
                                    "（也可在下拉框里换选其他 4110）。")
 
-        def native_settle(self):
-            """新版客户端原生结算：远程线程调用 0x587E40，客户端自行拼 4110 发送。"""
+        def native_settle_impl(self):
+            """原生结算同步实现（可在后台线程执行）：校验 + 远程线程调用 0x587E40。
+            返回结果消息字符串。"""
             handle, base = self.handle, self.base
-            if not handle or not base:
-                self.replay_status.set("未连接游戏进程。")
-                return
             sig = read_mem(handle, base + NATIVE_SETTLE_FN, len(NATIVE_SETTLE_SIG))
             if sig != NATIVE_SETTLE_SIG:
-                self.replay_status.set("当前客户端不是新版（0x587E40 序言不符），"
-                                       "原生结算不可用；请用直接结算。")
-                return
+                return "当前客户端不是新版（0x587E40 序言不符），原生结算不可用；请用直接结算。"
             if not read_u32(handle, base + NATIVE_SETTLE_MGR):
-                self.replay_status.set("战斗管理器为空：当前不在战斗中，无法结算。")
-                return
+                return "战斗管理器为空：当前不在战斗中，无法结算。"
             block = k32.VirtualAllocEx(handle, None, 4096, MEM_COMMIT_RESERVE,
                                        PAGE_READWRITE) or 0
             if not block:
-                self.replay_status.set(f"远程内存分配失败（{ctypes.get_last_error()}）。")
-                return
+                return f"远程内存分配失败（{ctypes.get_last_error()}）。"
             code = native_settle_code(base)
             got = ctypes.c_size_t(0)
             ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block), code,
@@ -3239,10 +3242,64 @@ def run_ui():
             if thread:
                 k32.WaitForSingleObject(thread, 3000)
                 k32.CloseHandle(thread)
-                self.replay_status.set("已调用原生结算：客户端已自行构造 4110 发送。")
+                result = "已调用原生结算：客户端已自行构造 4110 发送。"
             else:
-                self.replay_status.set(f"远程线程创建失败（{ctypes.get_last_error()}）。")
+                result = f"远程线程创建失败（{ctypes.get_last_error()}）。"
             k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+            return result
+
+        def native_settle(self):
+            """手动原生结算：后台线程执行，避免远程调用卡 UI。"""
+            if not self.handle or not self.base:
+                self.replay_status.set("未连接游戏进程。")
+                return
+            if self.native_busy:
+                self.replay_status.set("上一次原生结算尚未结束，请稍候。")
+                return
+            self.native_busy = True
+            self.replay_status.set("正在调用原生结算……")
+
+            def worker():
+                try:
+                    self.native_msg = self.native_settle_impl()
+                except Exception as exc:              # 任何异常都不许拖死勾选循环
+                    self.native_msg = f"原生结算异常：{exc}"
+                finally:
+                    self.native_busy = False
+            threading.Thread(target=worker, daemon=True).start()
+
+        def native_auto_tick(self):
+            """自动原生结算：进图（管理器非空）后延迟 2.5 秒调用一次，一局一次。
+            PVP 房服务器接受、闯关房拒收（实测均不掉线），全模式开启无副作用。"""
+            if self.native_msg:
+                self.replay_status.set(self.native_msg)
+                self.native_msg = None
+            if not self.native_auto_var.get() or not self.handle or not self.base:
+                return
+            if self.native_busy:
+                return
+            mgr = read_u32(self.handle, self.base + NATIVE_SETTLE_MGR)
+            if not mgr:
+                self.native_seen_battle = False       # 出图复位，下一局重新计时
+                return
+            now = now_ms()
+            if not self.native_seen_battle:
+                self.native_seen_battle = True        # 记进图时刻，延迟后触发
+                self.native_enter_ts = now
+                return
+            if now - self.native_enter_ts < 2500 or now - self.native_last_ts < 6000:
+                return
+            self.native_busy = True
+            self.native_last_ts = now
+
+            def worker():
+                try:
+                    self.native_msg = self.native_settle_impl()
+                except Exception as exc:
+                    self.native_msg = f"原生结算异常：{exc}"
+                finally:
+                    self.native_busy = False
+            threading.Thread(target=worker, daemon=True).start()
 
         def settle_send_with(self, tmpl, token):
             """按模板参数发送换好 token 的 4110，成功返回 True。"""
@@ -3448,6 +3505,7 @@ def run_ui():
             self.capture_tick()
             self.replay_tick()
             self.settle_auto_tick()
+            self.native_auto_tick()
             self.move_tick()
             self.click_tick()
             self.mem_tick()
