@@ -1739,7 +1739,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1035（对局号回退）")
+            root.title("属性助手 · 单机版 v1036（模板可选）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -1955,6 +1955,9 @@ def run_ui():
             self.settle_auto_var = tk.BooleanVar(value=False)    # 直接结算自动模式
             self.settle_last_token = None                        # 上次直接结算已发的 token
             self.settle_tmpl_cache = None                        # 锁定的 4110 模板副本
+            self.settle_tmpl_var = tk.StringVar(value="")        # 模板下拉框当前选择
+            self.settle_tmpl_rows = []                           # 模板下拉框快照 [(文本, 副本)]
+            self._settle_tmpl_seen = -1                          # 上次见到的可选模板数
             self.settle_last_ts = 0                              # 上次直接结算时间戳(冷却)
             crow = ttk.Frame(replaybox)
             crow.pack(fill="x", padx=8, pady=(4, 2))
@@ -2009,6 +2012,14 @@ def run_ui():
                        command=self.direct_settle).pack(side="left", padx=(8, 0))
             ttk.Button(srow, text="刷新模板",
                        command=self.settle_reset_tmpl).pack(side="left", padx=(8, 0))
+            trow = ttk.Frame(replaybox)
+            trow.pack(fill="x", padx=8, pady=(0, 2))
+            ttk.Label(trow, text="结算模板:").pack(side="left")
+            self.settle_tmpl_box = ttk.Combobox(
+                trow, textvariable=self.settle_tmpl_var, state="readonly",
+                width=46)
+            self.settle_tmpl_box.pack(side="left", padx=(6, 0))
+            self.settle_tmpl_box.bind("<<ComboboxSelected>>", self.on_settle_tmpl_pick)
             ttk.Checkbutton(srow, text="自动结算", variable=self.settle_auto_var
                             ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="带确认包", variable=self.settle_extras_var
@@ -2687,6 +2698,7 @@ def run_ui():
                 if len(self.packets) > 400:
                     del self.packets[:len(self.packets) - 400]
                 self.refresh_packet_list()
+                self.settle_tmpl_pick_refresh()
 
         def refresh_packet_list(self):
             self.packet_list.delete(0, "end")
@@ -2700,6 +2712,7 @@ def run_ui():
 
         def clear_packets(self):
             self.packets = []
+            self.settle_tmpl_pick_refresh()
             self.refresh_packet_list()
 
         def save_packets(self):
@@ -3095,6 +3108,39 @@ def run_ui():
                 return None
             return max(tails, key=lambda t: (tails[t], latest[t]))
 
+        def settle_tmpl_pick_refresh(self):
+            """刷新模板下拉框：列出抓包列表里所有游戏发的 4110（快照副本，
+            抓包列表 400 条裁剪不影响已列出的项）；默认选第一条。"""
+            tmpl_min = SETTLE_TOKEN_OFF + SETTLE_TOKEN_LEN
+            rows = []
+            for seq, r in enumerate(self.packets, 1):
+                if not r.get("mine") and r["id"] == 4110 \
+                        and len(r["data"]) >= tmpl_min:
+                    rows.append(("#%d  %s  %d字节" % (seq, r["time"], len(r["data"])),
+                                 dict(r, data=bytes(r["data"]))))
+            if len(rows) == self._settle_tmpl_seen:
+                return
+            self._settle_tmpl_seen = len(rows)
+            self.settle_tmpl_rows = rows
+            cur = self.settle_tmpl_var.get()
+            texts = [t for t, _ in rows]
+            self.settle_tmpl_box["values"] = texts
+            if cur not in texts:
+                # 无选择或原选择已被清空：回到第一条（= 原自动锁定行为）
+                self.settle_tmpl_var.set(texts[0] if texts else "")
+                self.settle_tmpl_cache = rows[0][1] if rows else None
+
+        def on_settle_tmpl_pick(self, _event=None):
+            """下拉框选中某条 4110 → 锁定其为结算模板。"""
+            cur = self.settle_tmpl_var.get()
+            for text, snap in self.settle_tmpl_rows:
+                if text == cur:
+                    self.settle_tmpl_cache = snap
+                    self.replay_status.set("结算模板已锁定 %s。"
+                                           % cur.replace("  ", " "))
+                    return
+            self.settle_tmpl_cache = None
+
         def settle_tmpl(self):
             """4110 模板：优先用已锁定的缓存；否则取列表里**第一条**游戏发的
             4110（≥0x4B 字节）锁定缓存。实测最新的 4110 可能是失败重试或
@@ -3110,10 +3156,13 @@ def run_ui():
             return None
 
         def settle_reset_tmpl(self):
-            """丢弃模板缓存：下一次直接结算取列表里新的第一条 4110。"""
+            """重置模板：丢弃缓存并把下拉框选回当前列表的第一条 4110。"""
             self.settle_tmpl_cache = None
             self.settle_last_token = None
-            self.replay_status.set("直接结算模板已重置：将取列表里新的一条 4110 锁定。")
+            self._settle_tmpl_seen = -1          # 强制重建下拉快照
+            self.settle_tmpl_pick_refresh()
+            self.replay_status.set("直接结算模板已重置：选回列表第一条 4110"
+                                   "（也可在下拉框里换选其他 4110）。")
 
         def settle_send_with(self, tmpl, token):
             """按模板参数发送换好 token 的 4110，成功返回 True。"""
