@@ -1045,9 +1045,11 @@ def native_enter_settle_code(base, buf):
       +0x000 主流程（0xF4 字节）   +0x100 SEH 处理器（0x93 字节）
       +0x1F4 原始 SEH 链           +0x1F8 安装时 ESP
       +0x200 快照 0x30 字节（Eip Eax Ecx Edx Ebx Esi Edi Ebp Esp | CTX 异常码 异常地址）
+      +0x238 桩命中标志           +0x23C 桩看到的包体指针
+      +0x240 记录 0 快照（0x57 字节，桩修正后）
       +0x2F0 [mgr]+0xAC 原值暂存  +0x300 假对象 A   +0x400 假虚表
       +0x500 xor eax,eax; ret     +0x510 E8 原 8 字节暂存
-      +0x560 4110 字段修正桩（0x36 字节）
+      +0x560 4110 字段修正桩（0x55 字节，含自证诊断）
     流程：[mgr] 空（未战斗）返回 2（此路径未做任何补丁，无需恢复）→ 暂存并
     补丁发送调用点 → 装假对象 → push 1 + thiscall 0x587E40 结算（4110 经桩
     修正后发出）→ 恢复 [mgr]+0xAC → 恢复调用点原字节。返回码：
@@ -1151,22 +1153,29 @@ def native_enter_settle_code(base, buf):
     fix_stub_bytes = bytes(
         [0x60]                                                # 560 pushad
         + [0x81, 0x7C, 0x24, 0x20, 0x0E, 0x10, 0x00, 0x00]    # 561 cmp dword [esp+0x20], 0x100E（E9 入口无返回地址，id 在原 [esp]）
-        + [0x75, 0x1E]                                        # 569 jne 0x589（其余原样放行）
+        + [0x75, 0x3D]                                        # 569 jne 0x5A8（其余原样放行）
         + [0x8B, 0x44, 0x24, 0x28]                            # 56B mov eax, [esp+0x28]（a3 = 包体，原 [esp+8]）
         + [0x66, 0xC7, 0x40, 0x02, 0x64, 0x00]                # 56F word [eax+0x02] = 100
         + [0xC7, 0x40, 0x25, 0x64, 0x00, 0x00, 0x00]          # 575 dword [eax+0x25] = 100
         + [0xC7, 0x40, 0x29, 0x01, 0x00, 0x00, 0x00]          # 57C dword [eax+0x29] = 1
         + [0x66, 0xC7, 0x40, 0x51, 0xB1, 0x05]                # 583 word [eax+0x51] = 0x05B1
-        + [0x61]                                              # 589 popad
-        + [0x68] + p(orig_ret)                                # 58A push 调用点返回地址（补回被 E9 吃掉的 call 语义，v1048 缺此步致栈错位崩溃）
-        + [0xB8] + p(send_fn)                                 # 58F mov eax, 0x63C950
-        + [0xFF, 0xE0])                                       # 594 jmp eax（发送函数视角 = 正常 call 帧，ret 恰回调用点下一条指令）
-    assert len(fix_stub_bytes) == 0x36, hex(len(fix_stub_bytes))
+        + [0xC7, 0x05] + p(buf + 0x238) + [1, 0, 0, 0]        # 589 桩自证：命中标志 = 1
+        + [0x89, 0x05] + p(buf + 0x23C)                       # 593 记录包体指针
+        + [0xBF] + p(buf + 0x240)                             # 599 mov edi, 记录0快照区
+        + [0x89, 0xC6]                                        # 59E mov esi, eax（包体）
+        + [0xB9, 0x57, 0x00, 0x00, 0x00]                      # 5A0 mov ecx, 0x57
+        + [0xFC]                                              # 5A5 cld
+        + [0xF3, 0xA4]                                        # 5A6 rep movsb（快照修正后的记录 0 供工具读取）
+        + [0x61]                                              # 5A8 popad
+        + [0x68] + p(orig_ret)                                # 5A9 push 调用点返回地址（补回被 E9 吃掉的 call 语义，v1048 缺此步致栈错位崩溃）
+        + [0xB8] + p(send_fn)                                 # 5AE mov eax, 0x63C950
+        + [0xFF, 0xE0])                                       # 5B3 jmp eax（发送函数视角 = 正常 call 帧，ret 恰回调用点下一条指令）
+    assert len(fix_stub_bytes) == 0x55, hex(len(fix_stub_bytes))
     out = bytearray(0x1000)
     out[:len(code)] = code
     out[0x100:0x193] = handler
     out[0x500:0x503] = b"\x33\xC0\xC3"                        # xor eax,eax; ret
-    out[0x560:0x596] = fix_stub_bytes
+    out[0x560:0x5B5] = fix_stub_bytes
     return bytes(out)
 
 
@@ -1238,12 +1247,19 @@ def enter_settle_code_self_test():
     stub = bytes(
         [0x60,
          0x81, 0x7C, 0x24, 0x20, 0x0E, 0x10, 0x00, 0x00,
-         0x75, 0x1E,
+         0x75, 0x3D,
          0x8B, 0x44, 0x24, 0x28,
          0x66, 0xC7, 0x40, 0x02, 0x64, 0x00,
          0xC7, 0x40, 0x25, 0x64, 0x00, 0x00, 0x00,
          0xC7, 0x40, 0x29, 0x01, 0x00, 0x00, 0x00,
          0x66, 0xC7, 0x40, 0x51, 0xB1, 0x05,
+         0xC7, 0x05, 0x38, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+         0x89, 0x05, 0x3C, 0x02, 0x00, 0x00,
+         0xBF, 0x40, 0x02, 0x00, 0x00,
+         0x89, 0xC6,
+         0xB9, 0x57, 0x00, 0x00, 0x00,
+         0xFC,
+         0xF3, 0xA4,
          0x61,
          0x68, 0x9D, 0x84, 0x98, 0x00,
          0xB8, 0x50, 0xC9, 0xA3, 0x00,
@@ -1297,15 +1313,15 @@ def enter_settle_code_self_test():
         return False
     if hins[0x190].mnemonic != 'ret' or hins[0x190].op_str != '0x10':
         return False
-    # 修正桩独立反汇编：pushad/cmp/jne/4 字段写入/popad/补返回地址/尾跳
-    sins = {i.address: i for i in md.disasm(code[0x560:0x596], 0x560)}
+    # 修正桩独立反汇编：pushad/cmp/jne/4 字段写入/自证快照/popad/补返回地址/尾跳
+    sins = {i.address: i for i in md.disasm(code[0x560:0x5B5], 0x560)}
     if sins[0x560].mnemonic not in ('pushad', 'pushal'):
         return False
     if sins[0x561].mnemonic != 'cmp' or sins[0x561].op_str != 'dword ptr [esp + 0x20], 0x100e':
         return False
-    if sins[0x569].mnemonic != 'jne' or int(sins[0x569].op_str, 16) != 0x589:
+    if sins[0x569].mnemonic != 'jne' or int(sins[0x569].op_str, 16) != 0x5A8:
         return False
-    if sins[0x589].mnemonic not in ('popad', 'popal'):
+    if sins[0x5A8].mnemonic not in ('popad', 'popal'):
         return False
     for off, want in ((0x56B, 'eax, dword ptr [esp + 0x28]'),
                       (0x56F, 'word ptr [eax + 2], 0x64'),
@@ -1314,9 +1330,13 @@ def enter_settle_code_self_test():
                       (0x583, 'word ptr [eax + 0x51], 0x5b1')):
         if sins[off].mnemonic != 'mov' or sins[off].op_str != want:
             return False
-    if sins[0x58A].mnemonic != 'push' or sins[0x58A].op_str != '0x98849d':
+    if sins[0x589].mnemonic != 'mov' or sins[0x589].op_str != 'dword ptr [0x238], 1':
         return False
-    if sins[0x594].mnemonic != 'jmp' or sins[0x594].op_str != 'eax':
+    if 'movsb' not in sins[0x5A6].mnemonic or 'rep' not in sins[0x5A6].mnemonic:
+        return False
+    if sins[0x5A9].mnemonic != 'push' or sins[0x5A9].op_str != '0x98849d':
+        return False
+    if sins[0x5B3].mnemonic != 'jmp' or sins[0x5B3].op_str != 'eax':
         return False
     if code[0x500:0x503] != b"\x33\xC0\xC3":
         return False
@@ -2156,7 +2176,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1049（房间内一键结算）")
+            root.title("属性助手 · 单机版 v1050（房间内一键结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -3662,7 +3682,9 @@ def run_ui():
             """房间内一键结算同步实现：单条 shellcode 完成——按 [mgr] 装假战绩
             对象 → 0x587E40 结算（v1047 起不再调用 0x63EEA0：房间内实测其内部
             运行时调用表未就绪必崩）；v1048 起发送点拦截修正 4110 的 4 个差异
-            字段（服务器只验包内容）。返回结果消息字符串（含线程返回码翻译）。"""
+            字段（服务器只验包内容）；v1050 起桩命中后快照记录 0（+0x238 命中
+            标志/+0x23C 包体指针/+0x240 快照），供工具读取弹窗自证。
+            返回结果消息字符串（含线程返回码翻译）。"""
             handle, base = self.handle, self.base
             for off, want in ((NATIVE_ENTER_INIT, NATIVE_ENTER_SIG),
                               (NATIVE_SETTLE_FN, NATIVE_SETTLE_SIG),
@@ -3712,6 +3734,11 @@ def run_ui():
                 raw = read_mem(handle, block + 0x200, 0x30)   # SEH 快照：释放前读出
                 if raw and len(raw) == 0x30:
                     dump = struct.unpack("<12I", raw)
+            pkt = None
+            if exit_code.value == 1:
+                raw = read_mem(handle, block + 0x238, 0x5F)   # 桩自证：命中标志+包体指针+记录0快照
+                if raw and len(raw) == 0x5F:
+                    pkt = raw
             k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
             if wait == WAIT_TIMEOUT or exit_code.value == 259:   # 259 = STILL_ACTIVE
                 return ("结算未在时限内完成（远程线程未退出）：请稍等几秒再点一次"
@@ -3742,6 +3769,21 @@ def run_ui():
                 write_diag_log(diag)
                 self.diag_msg = diag
                 return "房间结算异常已拦截，但未能读取寄存器快照。详情见弹窗。"
+            if exit_code.value == 1 and pkt is not None:
+                hit, bufptr = struct.unpack_from("<2I", pkt, 0)
+                hexs = " ".join(f"{b:02X}" for b in pkt[8:])
+                if hit == 1:
+                    diag = ("4110 发送桩自证：已命中并完成 4 字段修正。\n"
+                            f"包体=0x{bufptr:08X}\n记录0（修正后，0x57 字节）：\n{hexs}")
+                    logpath = write_diag_log(diag.replace("\n", " "))
+                    self.diag_msg = diag + ("\n\n（本框文字可直接 Ctrl+C 复制全文；"
+                                            + (f"日志：{logpath}" if logpath else "日志写入失败") + "）")
+                    return ("结算完成：4110 已发出并完成字段修正。发包快照已弹窗，"
+                            "若无奖励请把弹窗全文发给开发者。")
+                diag = "4110 发送桩未命中（包 id != 0x100E，未经修正原样发出）。"
+                write_diag_log(diag)
+                self.diag_msg = diag
+                return "结算完成但桩未命中：4110 未经修正原样发出。详情见弹窗。"
             return {1: "结算完成：客户端已发出修正后的 4110。",
                     2: "结算中止：战斗管理器为空（不在房间/对局内）。",
                     }.get(exit_code.value, f"结算返回未知码 {exit_code.value}。")
