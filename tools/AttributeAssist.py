@@ -34,6 +34,7 @@ TH32CS_SNAPMODULE = 0x8 | 0x10        # 64 位 Python 枚举 32 位游戏进程�
 MEM_COMMIT_RESERVE = 0x3000
 PAGE_READWRITE = 0x04
 PAGE_EXECUTE_READ = 0x20
+PAGE_EXECUTE_READWRITE = 0x40
 MEM_RELEASE = 0x8000
 BASE_FALLBACK = 0x400000              # 32 位 exe 默认 ImageBase
 
@@ -1003,79 +1004,147 @@ def settle_code_self_test():
     return code == expect
 
 
-def native_enter_settle_code(base):
-    """远程线程体（房间内一键「进局+结算」）：若战斗管理器已存在（已在局内）
-    直接结算；否则调 0x63EEA0 进局初始化（同步创建战斗管理器并写入
-    [0x13C8710]），管理器一出现立即 push 1 + thiscall 0x587E40 结算。
-    不等待关卡对象/在战斗状态——房间内永远等不到（v1041 教训）。返回码：
+def native_enter_settle_code(base, buf):
+    """远程线程体（房间内一键「进局+结算」，v1043：全程 SEH 保护）。
 
+    异常时 SEH 处理器把全部寄存器快照写回缓冲区尾部，再把 Context 的
+    Eip/Esp 改到清理路径，线程正常退出、客户端不崩；工具随后读出快照
+    定位崩溃点。缓冲区布局（base=ImageBase 用于游戏地址，buf=缓冲区
+    绝对地址用于自身数据）：
+      +0x000 主流程（0xA3 字节）   +0x100 SEH 处理器（0x74 字节）
+      +0x1F4 原始 SEH 链           +0x1F8 安装时 ESP
+      +0x200..0x224 快照：Eip Eax Ecx Edx Ebx Esi Edi Ebp Esp
+    流程：[mgr] 非空（已在局内）直接结算；否则 [game] 空返回 2；调
+    0x63EEA0 进局初始化（同步创建战斗管理器）→ 轮询 [mgr] 出现（300 万
+    轮上限 × pause）→ push 1 + thiscall 0x587E40 结算。返回码：
       1 = 已调结算（客户端发出 4110）
-      2 = 游戏管理器 [0x13C8708] 为空，无法进局
+      2 = 游戏管理器 [0x13C8708] 为空
       4 = 进局初始化已执行，但战斗管理器未出现（超时）
-
-    轮询上限 300 万轮 × pause（约数秒），单条 shellcode 内完成，结束后线程
-    以 ret 4 退出。汇编布局（偏移已按实际字节核对）：
-      00 push ebx; 01 [mgr]非0→DO(0x2F)（已在局内直接结算）;
-      0A [game]空→FAIL2(0x46); 13 call 0x63EEA0; 1A ebx=3000000;
-      1F POLL: [mgr]非0→DO(0x2F); 28 dec ebx, 0→FAIL4(0x4D), pause,
-      jmp POLL; 2F DO: push 1; ecx=[mgr]; call 0x587E40; eax=1;
-      46 FAIL2: eax=2; 4D FAIL4: eax=4; 52 EXIT: pop ebx; ret 4。"""
-    fn = (base + NATIVE_SETTLE_FN) & 0xFFFFFFFF
+      5 = 异常已拦截（快照可读，工具翻译成定位信息）"""
     mgr = (base + NATIVE_SETTLE_MGR) & 0xFFFFFFFF
     game = (base + NATIVE_GAME_MGR) & 0xFFFFFFFF
     ent = (base + NATIVE_ENTER_INIT) & 0xFFFFFFFF
-    p = lambda v: list(struct.pack("<I", v))
-    return bytes(
-        [0x53]                                        # push ebx
-        + [0xA1] + p(mgr)                             # mov eax, [战斗管理器]
-        + [0x85, 0xC0]                                # test eax, eax
-        + [0x75, 0x25]                                # jne DO(0x2F)：已在局内直接结算
-        + [0xA1] + p(game)                            # mov eax, [游戏管理器]
-        + [0x85, 0xC0]                                # test eax, eax
-        + [0x74, 0x33]                                # je FAIL2(0x46)
-        + [0xB8] + p(ent)                             # mov eax, 0x63EEA0
-        + [0xFF, 0xD0]                                # call eax（进局初始化，同步建管理器）
-        + [0xBB, 0xC0, 0xC6, 0x2D, 0x00]              # mov ebx, 3000000（轮询上限）
-        + [0xA1] + p(mgr)                             # POLL: mov eax, [战斗管理器]
-        + [0x85, 0xC0]                                # test eax, eax
-        + [0x75, 0x07]                                # jne DO(0x2F)
-        + [0x4B]                                      # dec ebx
-        + [0x74, 0x22]                                # jz FAIL4(0x4D)
-        + [0xF3, 0x90]                                # pause
-        + [0xEB, 0xF0]                                # jmp POLL(0x1F)
-        + [0x6A, 0x01]                                # DO: push 1（结算类型）
-        + [0xA1] + p(mgr)                             # mov eax, [战斗管理器]
-        + [0x8B, 0xC8]                                # mov ecx, eax（thiscall this）
-        + [0xB8] + p(fn)                              # mov eax, 0x587E40
-        + [0xFF, 0xD0]                                # call eax
-        + [0xB8, 0x01, 0x00, 0x00, 0x00]              # mov eax, 1
-        + [0xEB, 0x0C]                                # jmp EXIT(0x52)
-        + [0xB8, 0x02, 0x00, 0x00, 0x00]              # FAIL2: mov eax, 2
-        + [0xEB, 0x05]                                # jmp EXIT(0x52)
-        + [0xB8, 0x04, 0x00, 0x00, 0x00]              # FAIL4: mov eax, 4
-        + [0x5B]                                      # EXIT: pop ebx
-        + [0xC2, 0x04, 0x00])                         # ret 4
+    fn = (base + NATIVE_SETTLE_FN) & 0xFFFFFFFF
+    handler_va = (buf + 0x100) & 0xFFFFFFFF
+    orig = (buf + 0x1F4) & 0xFFFFFFFF
+    se = (buf + 0x1F8) & 0xFFFFFFFF
+    dump = (buf + 0x200) & 0xFFFFFFFF
+    p = lambda v: list(struct.pack("<I", v & 0xFFFFFFFF))
+    code = bytes(
+        [0x53, 0x56, 0x57]                                    # 00 push ebx; esi; edi
+        + [0x64, 0xA1, 0, 0, 0, 0]                            # 03 mov eax, fs:[0]（原链）
+        + [0xA3] + p(orig)                                    # 09 mov [ORIG], eax
+        + [0x68] + p(handler_va)                              # 0E push SEH 处理器
+        + [0x64, 0xFF, 0x35, 0, 0, 0, 0]                      # 13 push dword fs:[0]
+        + [0x64, 0x89, 0x25, 0, 0, 0, 0]                      # 1A mov fs:[0], esp（装帧）
+        + [0x89, 0x25] + p(se)                                # 21 mov [SE], esp（恢复用）
+        + [0xA1] + p(mgr)                                     # 26 mov eax, [mgr]
+        + [0x85, 0xC0]                                        # 2B test eax, eax
+        + [0x75, 0x2F]                                        # 2D jne DO(0x5F)（已在局内直接结算）
+        + [0x83, 0x3D] + p(game) + [0x00]                     # 2F cmp dword [game], 0
+        + [0x0F, 0x84] + p(0x39)                              # 37 je FAIL2(0x76)
+        + [0xB8] + p(ent)                                     # 3C mov eax, 0x63EEA0
+        + [0xFF, 0xD0]                                        # 41 call eax（进局初始化）
+        + [0xBB, 0xC0, 0xC6, 0x2D, 0x00]                      # 43 mov ebx, 3000000（轮询上限）
+        + [0x83, 0x3D] + p(mgr) + [0x00]                      # 48 POLL: cmp dword [mgr], 0
+        + [0x75, 0x0D]                                        # 4F jne DO(0x5F)
+        + [0x4B]                                              # 51 dec ebx
+        + [0x0F, 0x84] + p(0x24)                              # 52 je FAIL4(0x7D)
+        + [0xF3, 0x90]                                        # 58 pause
+        + [0xEB, 0xEC]                                        # 5A jmp POLL(0x48)
+        + [0x90, 0x90]                                        # 5C pad → 0x5E
+        + [0x6A, 0x01]                                        # 5F DO: push 1（结算类型）
+        + [0xA1] + p(mgr)                                     # 60 mov eax, [mgr]
+        + [0x8B, 0xC8]                                        # 65 mov ecx, eax（thiscall this）
+        + [0xB8] + p(fn)                                      # 67 mov eax, 0x587E40
+        + [0xFF, 0xD0]                                        # 6C call eax
+        + [0xB8, 0x01, 0x00, 0x00, 0x00]                      # 6E mov eax, 1
+        + [0xEB, 0x18]                                        # 73 jmp EXIT(0x8E)
+        + [0xB8, 0x02, 0x00, 0x00, 0x00]                      # 76 FAIL2: mov eax, 2
+        + [0xEB, 0x11]                                        # 7B jmp EXIT
+        + [0xB8, 0x04, 0x00, 0x00, 0x00]                      # 7D FAIL4: mov eax, 4
+        + [0xEB, 0x0A]                                        # 82 jmp EXIT
+        + [0xB8, 0x05, 0x00, 0x00, 0x00]                      # 84 CLEANUP: mov eax, 5
+        + [0xEB, 0x03]                                        # 89 jmp EXIT
+        + [0x90] * 3                                          # 8B pad → 0x8E
+        + [0x8B, 0x0D] + p(orig)                              # 8E EXIT: mov ecx, [ORIG]
+        + [0x64, 0x89, 0x0D, 0, 0, 0, 0]                      # 94 mov fs:[0], ecx（卸帧）
+        + [0x83, 0xC4, 0x08]                                  # 9B add esp, 8
+        + [0x5F, 0x5E, 0x5B]                                  # 9E pop edi; esi; ebx
+        + [0xC2, 0x04, 0x00])                                 # A1 ret 4
+    assert len(code) == 0xA4, hex(len(code))
+    handler = bytes(
+        [0x8B, 0x44, 0x24, 0x0C]                              # mov eax, [esp+0xC]（ContextRecord）
+        + [0xBF] + p(dump)                                    # mov edi, DUMP
+        + [0x8B, 0x88, 0xB8, 0, 0, 0] + [0x89, 0x0F]          # 快照 Eip(0xB8)
+        + [0x8B, 0x88, 0xB0, 0, 0, 0] + [0x89, 0x47, 0x04]    # Eax(0xB0)
+        + [0x8B, 0x88, 0xAC, 0, 0, 0] + [0x89, 0x47, 0x08]    # Ecx(0xAC)
+        + [0x8B, 0x88, 0xA8, 0, 0, 0] + [0x89, 0x47, 0x0C]    # Edx(0xA8)
+        + [0x8B, 0x88, 0xA4, 0, 0, 0] + [0x89, 0x47, 0x10]    # Ebx(0xA4)
+        + [0x8B, 0x88, 0xA0, 0, 0, 0] + [0x89, 0x47, 0x14]    # Esi(0xA0)
+        + [0x8B, 0x88, 0x9C, 0, 0, 0] + [0x89, 0x47, 0x18]    # Edi(0x9C)
+        + [0x8B, 0x88, 0xB4, 0, 0, 0] + [0x89, 0x47, 0x1C]    # Ebp(0xB4)
+        + [0x8B, 0x88, 0xC4, 0, 0, 0] + [0x89, 0x47, 0x20]    # Esp(0xC4)
+        + [0xC7, 0x80, 0xB8, 0, 0, 0] + p(buf + 0x84)         # Context->Eip = CLEANUP
+        + [0x8B, 0x0D] + p(se)                                # mov ecx, [SE]
+        + [0x89, 0x88, 0xC4, 0, 0, 0]                         # Context->Esp = SE
+        + [0x33, 0xC0]                                        # xor eax, eax（继续执行）
+        + [0xC2, 0x10, 0x00])                                 # ret 16
+    assert len(handler) == 0x74, hex(len(handler))
+    out = bytearray(0x228)
+    out[:len(code)] = code
+    out[0x100:0x174] = handler
+    return bytes(out)
 
 
 def enter_settle_code_self_test():
-    """native_enter_settle_code 的自检：字节级比对 + capstone 语义核对
-    （每个跳转的落点指令必须是预期类型，两处 call eax 必须指向目标函数）。"""
-    code = native_enter_settle_code(0x400000)
-    expect = bytes(
-        [0x53,
-         0xA1, 0x10, 0x87, 0x7C, 0x01, 0x85, 0xC0, 0x75, 0x25,
-         0xA1, 0x08, 0x87, 0x7C, 0x01, 0x85, 0xC0, 0x74, 0x33,
+    """native_enter_settle_code 自检：字节级比对（buf=0 时全部绝对地址确定）
+    + capstone 语义核对（SEH 恢复链、跳转落点、call 目标、处理器尾部）。"""
+    code = native_enter_settle_code(0x400000, 0)
+    main = bytes(
+        [0x53, 0x56, 0x57,
+         0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,
+         0xA3, 0xF4, 0x01, 0x00, 0x00,
+         0x68, 0x00, 0x01, 0x00, 0x00,
+         0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00,
+         0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00,
+         0x89, 0x25, 0xF8, 0x01, 0x00, 0x00,
+         0xA1, 0x10, 0x87, 0x7C, 0x01, 0x85, 0xC0, 0x75, 0x2F,
+         0x83, 0x3D, 0x08, 0x87, 0x7C, 0x01, 0x00, 0x0F, 0x84, 0x39, 0x00, 0x00, 0x00,
          0xB8, 0xA0, 0xEE, 0xA3, 0x00, 0xFF, 0xD0,
          0xBB, 0xC0, 0xC6, 0x2D, 0x00,
-         0xA1, 0x10, 0x87, 0x7C, 0x01, 0x85, 0xC0, 0x75, 0x07,
-         0x4B, 0x74, 0x22, 0xF3, 0x90, 0xEB, 0xF0,
+         0x83, 0x3D, 0x10, 0x87, 0x7C, 0x01, 0x00, 0x75, 0x0D,
+         0x4B, 0x0F, 0x84, 0x24, 0x00, 0x00, 0x00, 0xF3, 0x90, 0xEB, 0xEC,
+         0x90, 0x90,
          0x6A, 0x01, 0xA1, 0x10, 0x87, 0x7C, 0x01, 0x8B, 0xC8,
          0xB8, 0x40, 0x7E, 0x98, 0x00, 0xFF, 0xD0,
-         0xB8, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x0C,
-         0xB8, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x05,
-         0xB8, 0x04, 0x00, 0x00, 0x00,
-         0x5B, 0xC2, 0x04, 0x00])
-    if code != expect:
+         0xB8, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x18,
+         0xB8, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x11,
+         0xB8, 0x04, 0x00, 0x00, 0x00, 0xEB, 0x0A,
+         0xB8, 0x05, 0x00, 0x00, 0x00, 0xEB, 0x03,
+         0x90, 0x90, 0x90,
+         0x8B, 0x0D, 0xF4, 0x01, 0x00, 0x00,
+         0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00,
+         0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0xC2, 0x04, 0x00])
+    handler = bytes(
+        [0x8B, 0x44, 0x24, 0x0C,
+         0xBF, 0x00, 0x02, 0x00, 0x00,
+         0x8B, 0x88, 0xB8, 0x00, 0x00, 0x00, 0x89, 0x0F,
+         0x8B, 0x88, 0xB0, 0x00, 0x00, 0x00, 0x89, 0x47, 0x04,
+         0x8B, 0x88, 0xAC, 0x00, 0x00, 0x00, 0x89, 0x47, 0x08,
+         0x8B, 0x88, 0xA8, 0x00, 0x00, 0x00, 0x89, 0x47, 0x0C,
+         0x8B, 0x88, 0xA4, 0x00, 0x00, 0x00, 0x89, 0x47, 0x10,
+         0x8B, 0x88, 0xA0, 0x00, 0x00, 0x00, 0x89, 0x47, 0x14,
+         0x8B, 0x88, 0x9C, 0x00, 0x00, 0x00, 0x89, 0x47, 0x18,
+         0x8B, 0x88, 0xB4, 0x00, 0x00, 0x00, 0x89, 0x47, 0x1C,
+         0x8B, 0x88, 0xC4, 0x00, 0x00, 0x00, 0x89, 0x47, 0x20,
+         0xC7, 0x80, 0xB8, 0x00, 0x00, 0x00, 0x84, 0x00, 0x00, 0x00,
+         0x8B, 0x0D, 0xF8, 0x01, 0x00, 0x00,
+         0x89, 0x88, 0xC4, 0x00, 0x00, 0x00,
+         0x33, 0xC0, 0xC2, 0x10, 0x00])
+    expect = (main + b"\x00" * (0x100 - len(main)) + handler
+              + b"\x00" * (0x228 - 0x100 - len(handler)))
+    if len(code) != 0x228 or code != expect:
         return False
     try:
         from capstone import Cs, CS_ARCH_X86, CS_MODE_32
@@ -1084,24 +1153,30 @@ def enter_settle_code_self_test():
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     ins = {i.address: i for i in md.disasm(code, 0)}
     # call eax 本身 op_str 是寄存器，目标看前一条 mov eax, imm32
-    for call_off, fn in ((0x18, 0xA3EEA0), (0x3D, 0x987E40)):
+    for call_off, ld_off, fn in ((0x42, 0x3D, 0xA3EEA0), (0x6D, 0x68, 0x987E40)):
         if ins[call_off].mnemonic != 'call' or ins[call_off].op_str != 'eax':
             return False
-        loader = ins[call_off - 5]               # mov eax, imm32
+        loader = ins[ld_off]
         if loader.mnemonic != 'mov' or not loader.op_str.endswith(', ' + hex(fn)):
             return False
-    # 跳转落点语义核对：(偏移, 期望助记符, 期望落点助记符)
-    for off, mn, tgt_mn in ((0x08, 'jne', 'push'), (0x11, 'je', 'mov'),
-                            (0x26, 'jne', 'push'), (0x29, 'je', 'mov'),
-                            (0x2D, 'jmp', 'mov'), (0x44, 'jmp', 'pop'),
-                            (0x4B, 'jmp', 'pop')):
+    # 跳转落点语义核对：(偏移, 期望助记符, 期望落点偏移, 落点助记符)
+    for off, mn, tgt, tgt_mn in (
+            (0x2E, 'jne', 0x5F, 'push'), (0x37, 'je', 0x76, 'mov'),
+            (0x50, 'jne', 0x5F, 'push'), (0x53, 'je', 0x7D, 'mov'),
+            (0x5B, 'jmp', 0x49, 'cmp'), (0x74, 'jmp', 0x8E, 'mov'),
+            (0x7B, 'jmp', 0x8E, 'mov'), (0x82, 'jmp', 0x8E, 'mov'),
+            (0x89, 'jmp', 0x8E, 'mov')):
         i = ins[off]
-        if i.mnemonic != mn:
+        if i.mnemonic != mn or int(i.op_str, 16) != tgt or ins[tgt].mnemonic != tgt_mn:
             return False
-        tgt = int(i.op_str, 16)
-        if tgt not in ins or ins[tgt].mnemonic != tgt_mn:
-            return False
-    if ins[0x53].mnemonic != 'ret' or ins[0x53].op_str != '4':
+    if ins[0xA1].mnemonic != 'ret' or ins[0xA1].op_str != '4':
+        return False
+    if not ins[0x100].op_str.startswith('eax, dword ptr [esp + 0xc]'):
+        return False
+    if ins[0x159].mnemonic != 'mov' \
+            or ins[0x159].op_str != 'dword ptr [eax + 0xb8], 0x84':
+        return False
+    if ins[0x171].mnemonic != 'ret' or ins[0x171].op_str != '0x10':
         return False
     return True
 
@@ -1926,7 +2001,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1042（房间内进局结算）")
+            root.title("属性助手 · 单机版 v1043（房间内进局结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -3439,20 +3514,24 @@ def run_ui():
                     return "当前客户端不是新版（进局/结算函数序言不符），房间进局结算不可用。"
             if not read_u32(handle, base + NATIVE_GAME_MGR):
                 return "游戏管理器为空：客户端状态异常，无法进局。"
+            pre = {n: read_u32(handle, base + r) for n, r in
+                   (("ctx", 0x13C86F8), ("game", NATIVE_GAME_MGR),
+                    ("mgr", NATIVE_SETTLE_MGR))}
             block = k32.VirtualAllocEx(handle, None, 4096, MEM_COMMIT_RESERVE,
                                        PAGE_READWRITE) or 0
             if not block:
                 return f"远程内存分配失败（{ctypes.get_last_error()}）。"
-            code = native_enter_settle_code(base)
+            blob = native_enter_settle_code(base, block)
             got = ctypes.c_size_t(0)
-            ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block), code,
-                                             len(code), ctypes.byref(got))) \
-                and got.value == len(code)
+            ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block), blob,
+                                             len(blob), ctypes.byref(got))) \
+                and got.value == len(blob)
             if ok:
                 previous = wintypes.DWORD(0)
+                # RWX：SEH 处理器要把寄存器快照写回缓冲区尾部
                 ok = bool(k32.VirtualProtectEx(handle, ctypes.c_void_p(block), 4096,
-                                               PAGE_EXECUTE_READ, ctypes.byref(previous)))
-                k32.FlushInstructionCache(handle, ctypes.c_void_p(block), len(code))
+                                               PAGE_EXECUTE_READWRITE, ctypes.byref(previous)))
+                k32.FlushInstructionCache(handle, ctypes.c_void_p(block), len(blob))
             thread = 0
             if ok:
                 thread = k32.CreateRemoteThread(handle, None, 0, ctypes.c_void_p(block),
@@ -3464,10 +3543,26 @@ def run_ui():
             exit_code = wintypes.DWORD(0)
             k32.GetExitCodeThread(thread, ctypes.byref(exit_code))
             k32.CloseHandle(thread)
+            dump = None
+            if exit_code.value == 5:
+                raw = read_mem(handle, block + 0x200, 0x24)   # SEH 快照：释放前读出
+                if raw and len(raw) == 0x24:
+                    dump = struct.unpack("<9I", raw)
             k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
             if wait == WAIT_TIMEOUT or exit_code.value == 259:   # 259 = STILL_ACTIVE
                 return ("进局初始化仍在执行（可能正在加载）：请等几秒后再点一次"
                         "「房间进局结算」，或直接点「原生结算」。")
+            if exit_code.value == 5:
+                def fmt(v):
+                    v &= 0xFFFFFFFF
+                    return f"0x{v:08X}" + (f"(RVA 0x{v - base:X})" if base <= v < base + 0x800000 else "")
+                if dump:
+                    eip, eax, ecx, edx, ebx, esi, edi, ebp, esp = dump
+                    return (f"进局路径异常已拦截（客户端未崩溃）。EIP={fmt(eip)} EAX={fmt(eax)} "
+                            f"ECX={fmt(ecx)} EDX={fmt(edx)} EBX={fmt(ebx)} ESI={fmt(esi)} "
+                            f"EDI={fmt(edi)} EBP={fmt(ebp)} ESP={fmt(esp)}；进局前 ctx={pre['ctx']} "
+                            f"game={pre['game']} mgr={pre['mgr']}。请把本行完整发给开发者。")
+                return "进局路径异常已拦截（客户端未崩溃），但未能读取寄存器快照，请告知开发者。"
             return {1: "进局+结算完成：客户端已发出 4110。",
                     2: "进局中止：游戏管理器为空。",
                     4: ("进局初始化已执行，但战斗管理器未创建（超时）。"
