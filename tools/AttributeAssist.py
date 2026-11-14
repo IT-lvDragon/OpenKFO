@@ -59,7 +59,12 @@ KILL_HEALTH_OFF = 0x5E45B0            # 目标血量读取，序言 0x81EC8B55
 # 注意：反汇编输出里的 [0x17C8710] 等是 VA（ImageBase=0x400000），此处一律存 RVA = VA - 0x400000
 NATIVE_SETTLE_FN = 0x587E40           # thiscall 结算函数：this=[0x13C8710]，参数 word=结算类型(抓包实测 1)
 NATIVE_SETTLE_MGR = 0x13C8710         # 战斗管理器全局指针（旧版 MANAGER_PTR 0x13C8708 的邻居；非空 = 在战斗中）
+NATIVE_GAME_MGR = 0x13C8708           # 游戏全局管理器指针（旧版 MANAGER_PTR）
+NATIVE_STAGE_GET = 0x419120           # 关卡对象获取：0x419120([0x13C8708]) -> 关卡对象或 0
+NATIVE_IN_BATTLE = 0x4B3F0            # 在战斗判定：0x4B3F0(关卡对象) -> 关卡+0x1B74（非 0 = 战斗中）
 NATIVE_SETTLE_SIG = b"\x55\x8B\xEC\x81\xEC\x64\x03\x00\x00"   # 0x587E40 序言（旧版客户端该 RVA 几乎必不相同）
+NATIVE_GUARD_SIGS = ((NATIVE_STAGE_GET, b"\x55\x8B\xEC\x51"),
+                     (NATIVE_IN_BATTLE, b"\x55\x8B\xEC\x51"))  # 守卫函数序言
 
 # ---- Win32 绑定 ----
 k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
@@ -930,34 +935,58 @@ class KillJob:
 
 
 def native_settle_code(base):
-    """远程线程体：push 1; ecx=[战斗管理器]; call 原生 4110 结算函数; ret 4。
+    """远程线程体：客户端同款「在战斗中」守卫 + push 1 + call 0x587E40 + ret 4。
 
+    守卫与客户端结算发起函数 0x53C890 完全一致：
+      1. [战斗管理器] 非空；2. 0x419120([全局管理器]) 返回关卡对象；
+      3. 0x4B3F0(关卡对象) = 关卡->0x1B74 非 0。
+    房间/大厅态任一不过即空跑返回，杜绝房间点结算崩溃（半初始化对象）。
     客户端用当前实时状态自行拼 8×87B 的合法 4110 并经 0x63C950 发出，
-    全程不修改任何游戏字节；管理器为空时直接返回。地址 = base + RVA。"""
+    全程不修改任何游戏字节。地址 = base + RVA。"""
     fn = (base + NATIVE_SETTLE_FN) & 0xFFFFFFFF
     mgr = (base + NATIVE_SETTLE_MGR) & 0xFFFFFFFF
+    game = (base + NATIVE_GAME_MGR) & 0xFFFFFFFF
+    g1 = (base + NATIVE_STAGE_GET) & 0xFFFFFFFF
+    g2 = (base + NATIVE_IN_BATTLE) & 0xFFFFFFFF
+    p = lambda v: list(struct.pack("<I", v))
+    # je 偏移：三处守卫的「失败」跳转目标都是尾部 xor 段
+    # je1 越过 16 字节（2+5+2+2+5）；je2 越过 27 字节（2+5+2+2+5+2+2+5+2）；je3 越过 16 字节
     return bytes(
-        [0x6A, 0x01]                                  # push 1（结算类型，与真实抓包一致）
-        + [0xA1] + list(struct.pack("<I", mgr))       # mov eax, [mgr]
+        [0xA1] + p(mgr)                               # mov eax, [战斗管理器]
         + [0x85, 0xC0]                                # test eax, eax
-        + [0x74, 0x09]                                # je -> xor 段（跳过 9 字节到 +20）
+        + [0x74, 0x10]                                # je fail
+        + [0x8B, 0x0D] + p(game)                      # mov ecx, [全局管理器]
+        + [0xB8] + p(g1)                              # mov eax, 0x419120
+        + [0xFF, 0xD0]                                # call eax -> 关卡对象
+        + [0x85, 0xC0]                                # test eax, eax
+        + [0x74, 0x1B]                                # je fail
+        + [0x8B, 0xC8]                                # mov ecx, eax
+        + [0xB8] + p(g2)                              # mov eax, 0x4B3F0
+        + [0xFF, 0xD0]                                # call eax -> +0x1B74
+        + [0x85, 0xC0]                                # test eax, eax
+        + [0x74, 0x10]                                # je fail
+        + [0x6A, 0x01]                                # push 1（结算类型，与真实抓包一致）
+        + [0xA1] + p(mgr)                             # mov eax, [战斗管理器]
         + [0x8B, 0xC8]                                # mov ecx, eax（thiscall this）
-        + [0xB8] + list(struct.pack("<I", fn))        # mov eax, fn
+        + [0xB8] + p(fn)                              # mov eax, fn
         + [0xFF, 0xD0]                                # call eax
-        + [0x33, 0xC0]                                # xor eax, eax
+        + [0x33, 0xC0]                                # fail: xor eax, eax
         + [0xC2, 0x04, 0x00])                         # ret 4（平衡线程入口参数）
 
 
 def settle_code_self_test():
-    """native_settle_code 的字节级自检：结构 + je 跳转偏移。"""
+    """native_settle_code 的字节级自检：完整字节序列（ImageBase 0x400000）。"""
     code = native_settle_code(0x400000)
-    expect = bytes([0x6A, 0x01, 0xA1, 0x10, 0xC8, 0x17, 0x01, 0x85, 0xC0, 0x74, 0x09,
-                    0x8B, 0xC8, 0xB8, 0x40, 0x7E, 0x98, 0x01, 0xFF, 0xD0, 0x33, 0xC0,
-                    0xC2, 0x04, 0x00])
-    if code != expect:
-        return False
-    assert code[11:13] == b"\x8b\xc8" and code[20:22] == b"\xff\xd0"
-    return True
+    expect = bytes(
+        [0xA1, 0x10, 0xC8, 0x17, 0x01, 0x85, 0xC0, 0x74, 0x10,
+         0x8B, 0x0D, 0x08, 0xC8, 0x17, 0x01,
+         0xB8, 0x20, 0x91, 0x81, 0x01, 0xFF, 0xD0, 0x85, 0xC0, 0x74, 0x1B,
+         0x8B, 0xC8,
+         0xB8, 0xF0, 0xB3, 0x84, 0x01, 0xFF, 0xD0, 0x85, 0xC0, 0x74, 0x10,
+         0x6A, 0x01, 0xA1, 0x10, 0xC8, 0x17, 0x01, 0x8B, 0xC8,
+         0xB8, 0x40, 0x7E, 0x98, 0x01, 0xFF, 0xD0,
+         0x33, 0xC0, 0xC2, 0x04, 0x00])
+    return code == expect
 
 
 # ---- 结算重放：钩住发包函数抓包，改字节后经原生 send 原样重发 ----
@@ -1777,7 +1806,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1038（自动原生结算）")
+            root.title("属性助手 · 单机版 v1039（结算防崩溃）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -3219,8 +3248,14 @@ def run_ui():
             sig = read_mem(handle, base + NATIVE_SETTLE_FN, len(NATIVE_SETTLE_SIG))
             if sig != NATIVE_SETTLE_SIG:
                 return "当前客户端不是新版（0x587E40 序言不符），原生结算不可用；请用直接结算。"
+            for off, want in NATIVE_GUARD_SIGS:     # 守卫函数序言也要校验
+                if read_mem(handle, base + off, len(want)) != want:
+                    return "当前客户端不是新版（守卫函数序言不符），原生结算不可用。"
             if not read_u32(handle, base + NATIVE_SETTLE_MGR):
                 return "战斗管理器为空：当前不在战斗中，无法结算。"
+            if not read_u32(handle, base + NATIVE_GAME_MGR):
+                return "游戏管理器为空：客户端状态异常，已取消。"
+            # shellcode 内还有客户端同款三重守卫，房间半初始化对象也不会崩溃
             block = k32.VirtualAllocEx(handle, None, 4096, MEM_COMMIT_RESERVE,
                                        PAGE_READWRITE) or 0
             if not block:
