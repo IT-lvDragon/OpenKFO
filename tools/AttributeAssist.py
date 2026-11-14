@@ -1181,6 +1181,19 @@ def enter_settle_code_self_test():
     return True
 
 
+def write_diag_log(text):
+    """诊断信息追加写入 exe 同目录日志（时间戳前缀），返回日志路径。"""
+    try:
+        folder = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+            else os.getcwd()
+        path = os.path.join(folder, "AttributeAssist_diag.log")
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + text + "\n")
+        return path
+    except OSError:
+        return ""
+
+
 # ---- 结算重放：钩住发包函数抓包，改字节后经原生 send 原样重发 ----
 HOOK_CTR_OFF = 0        # 抓包数据块：发包计数器（游戏线程 lock xadd 递增）
 HOOK_MARKER_OFF = 4     # 抓包数据块：重放标记（重放线程置 1，钩子记录进槽）
@@ -1996,12 +2009,12 @@ def elevate():
 
 def run_ui():
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import ttk, messagebox
 
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1043（房间内进局结算）")
+            root.title("属性助手 · 单机版 v1044（房间内进局结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2222,6 +2235,7 @@ def run_ui():
             self.native_4110_base = 0                            # 进图时已有的我发 4110 计数
             self.native_busy = False                             # 原生结算后台线程进行中
             self.native_msg = None                               # 后台线程完成后待上屏的消息
+            self.diag_msg = None                                 # 待弹窗的完整诊断（主线程弹出）
             self.settle_last_token = None                        # 上次直接结算已发的 token
             self.settle_tmpl_cache = None                        # 锁定的 4110 模板副本
             self.settle_tmpl_var = tk.StringVar(value="")        # 模板下拉框当前选择
@@ -3558,11 +3572,19 @@ def run_ui():
                     return f"0x{v:08X}" + (f"(RVA 0x{v - base:X})" if base <= v < base + 0x800000 else "")
                 if dump:
                     eip, eax, ecx, edx, ebx, esi, edi, ebp, esp = dump
-                    return (f"进局路径异常已拦截（客户端未崩溃）。EIP={fmt(eip)} EAX={fmt(eax)} "
-                            f"ECX={fmt(ecx)} EDX={fmt(edx)} EBX={fmt(ebx)} ESI={fmt(esi)} "
-                            f"EDI={fmt(edi)} EBP={fmt(ebp)} ESP={fmt(esp)}；进局前 ctx={pre['ctx']} "
-                            f"game={pre['game']} mgr={pre['mgr']}。请把本行完整发给开发者。")
-                return "进局路径异常已拦截（客户端未崩溃），但未能读取寄存器快照，请告知开发者。"
+                    diag = ("进局路径异常已拦截（客户端未崩溃）。\n"
+                            f"EIP={fmt(eip)}\nEAX={fmt(eax)}\nECX={fmt(ecx)}\nEDX={fmt(edx)}\n"
+                            f"EBX={fmt(ebx)}\nESI={fmt(esi)}\nEDI={fmt(edi)}\nEBP={fmt(ebp)}\n"
+                            f"ESP={fmt(esp)}\n"
+                            f"进局前 ctx={pre['ctx']} game={pre['game']} mgr={pre['mgr']}")
+                    logpath = write_diag_log(diag.replace("\n", " "))
+                    self.diag_msg = diag + ("\n\n（本框文字可直接 Ctrl+C 复制全文；"
+                                            + (f"日志：{logpath}" if logpath else "日志写入失败") + "）")
+                    return "进局路径异常已拦截（客户端未崩溃）。完整诊断已弹窗并写入日志。"
+                diag = "进局路径异常已拦截（客户端未崩溃），但未能读取寄存器快照。"
+                write_diag_log(diag)
+                self.diag_msg = diag
+                return "进局路径异常已拦截，但未能读取寄存器快照。详情见弹窗。"
             return {1: "进局+结算完成：客户端已发出 4110。",
                     2: "进局中止：游戏管理器为空。",
                     4: ("进局初始化已执行，但战斗管理器未创建（超时）。"
@@ -3597,6 +3619,9 @@ def run_ui():
             if self.native_msg:
                 self.replay_status.set(self.native_msg)
                 self.native_msg = None
+            if self.diag_msg:                    # 主线程弹窗：Windows 消息框可 Ctrl+C 复制
+                msg, self.diag_msg = self.diag_msg, None
+                messagebox.showinfo("房间进局结算诊断", msg)
             if not self.native_auto_var.get() or not self.handle or not self.base:
                 return
             mgr = read_u32(self.handle, self.base + NATIVE_SETTLE_MGR)
