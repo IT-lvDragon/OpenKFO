@@ -55,8 +55,9 @@ KILL_DAMAGE_OFF = 0x5F29F0            # thiscall 伤害调用，序言 0x83EC8B5
 KILL_HEALTH_OFF = 0x5E45B0            # 目标血量读取，序言 0x81EC8B55
 
 # ---- 原生结算：新版 gfld.dat 逆向（0x587E40 拼好 8×87B 的 4110 并经 0x63C950 发送）----
-NATIVE_SETTLE_FN = 0x587E40           # thiscall 结算函数：this=[0x17C8710]，参数 word=结算类型(抓包实测 1)
-NATIVE_SETTLE_MGR = 0x17C8710         # 战斗管理器全局指针（非空 = 在战斗中）
+# 注意：反汇编输出里的 [0x17C8710] 等是 VA（ImageBase=0x400000），此处一律存 RVA = VA - 0x400000
+NATIVE_SETTLE_FN = 0x587E40           # thiscall 结算函数：this=[0x13C8710]，参数 word=结算类型(抓包实测 1)
+NATIVE_SETTLE_MGR = 0x13C8710         # 战斗管理器全局指针（旧版 MANAGER_PTR 0x13C8708 的邻居；非空 = 在战斗中）
 NATIVE_SETTLE_SIG = b"\x55\x8B\xEC\x81\xEC\x64\x03\x00\x00"   # 0x587E40 序言（旧版客户端该 RVA 几乎必不相同）
 
 # ---- Win32 绑定 ----
@@ -949,7 +950,7 @@ def native_settle_code(base):
 def settle_code_self_test():
     """native_settle_code 的字节级自检：结构 + je 跳转偏移。"""
     code = native_settle_code(0x400000)
-    expect = bytes([0x6A, 0x01, 0xA1, 0x10, 0xC7, 0x5B, 0x01, 0x85, 0xC0, 0x74, 0x09,
+    expect = bytes([0x6A, 0x01, 0xA1, 0x10, 0xC8, 0x17, 0x01, 0x85, 0xC0, 0x74, 0x09,
                     0x8B, 0xC8, 0xB8, 0x40, 0x7E, 0x98, 0x01, 0xFF, 0xD0, 0x33, 0xC0,
                     0xC2, 0x04, 0x00])
     if code != expect:
