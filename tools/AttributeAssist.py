@@ -86,7 +86,10 @@ NATIVE_ENTER_SIG = b"\x55\x8B\xEC\x6A\xFF\x68\x12\xAA\xAD\x00"  # 0x63EEA0 序�
 # 字段来自运行时解密区的 actor getter（0x9e3c70/0x9e3cd0/0x9e45b0），静态不可
 # 读，故在发送点拦截修正：0x587E40 内唯一一条 call 0x63C950（E8）临时改 E9 →
 # 修正桩——桩只拦 id=0x100E 的包、把 4 个字段改成局内已验证值，其余包原样
-# 放行，尾跳 0x63C950 正常发送；返回后（含异常清理路径）恢复 E8 原 5 字节。
+# 放行；E9 是跳转不压栈，桩放行前必须 push 调用点返回地址再跳 0x63C950，
+# 补回 call 语义（v1048 漏了这步→发送函数栈错位 4 字节→崩于 0x263880）；
+# 发送函数 ret 恰回调用点下一条指令，栈上参数原样留给 0x587E40 清理。
+# 返回后（含异常清理路径）恢复 E8 原 8 字节。
 # 0x63C950 本体不动，其他网络流量不受影响；.text 页由工具先 VirtualProtectEx。
 NATIVE_SEND_FN = 0x63C950             # 4110 发送函数 cdecl(id, a2, buf, len)
 NATIVE_SEND_CALL = 0x588498           # 0x587E40 内唯一一条 call 0x63C950
@@ -1044,7 +1047,7 @@ def native_enter_settle_code(base, buf):
       +0x200 快照 0x30 字节（Eip Eax Ecx Edx Ebx Esi Edi Ebp Esp | CTX 异常码 异常地址）
       +0x2F0 [mgr]+0xAC 原值暂存  +0x300 假对象 A   +0x400 假虚表
       +0x500 xor eax,eax; ret     +0x510 E8 原 8 字节暂存
-      +0x560 4110 字段修正桩（0x31 字节）
+      +0x560 4110 字段修正桩（0x36 字节）
     流程：[mgr] 空（未战斗）返回 2（此路径未做任何补丁，无需恢复）→ 暂存并
     补丁发送调用点 → 装假对象 → push 1 + thiscall 0x587E40 结算（4110 经桩
     修正后发出）→ 恢复 [mgr]+0xAC → 恢复调用点原字节。返回码：
@@ -1058,6 +1061,7 @@ def native_enter_settle_code(base, buf):
     fix_stub = (buf + 0x560) & 0xFFFFFFFF
     save8 = (buf + 0x510) & 0xFFFFFFFF
     rel32 = (fix_stub - call_site - 5) & 0xFFFFFFFF   # E9 rel32 → 修正桩
+    orig_ret = (call_site + 5) & 0xFFFFFFFF           # 桩放行时补 push 的返回地址
     fake_a = (buf + 0x300) & 0xFFFFFFFF
     fake_vt = (buf + 0x400) & 0xFFFFFFFF
     fake_stub = (buf + 0x500) & 0xFFFFFFFF
@@ -1145,23 +1149,24 @@ def native_enter_settle_code(base, buf):
         + [0xC2, 0x10, 0x00])                                 # 190 ret 16
     assert len(handler) == 0x93, hex(len(handler))
     fix_stub_bytes = bytes(
-        [0x81, 0x7C, 0x24, 0x04, 0x0E, 0x10, 0x00, 0x00]      # 560 cmp dword [esp+4], 0x100E（只拦 4110）
-        + [0x75, 0x20]                                        # 568 jne 0x58A（其余原样放行）
-        + [0x60]                                              # 56A pushad
-        + [0x8B, 0x44, 0x24, 0x2C]                            # 56B mov eax, [esp+0x2C]（a3 = 包体）
+        [0x60]                                                # 560 pushad
+        + [0x81, 0x7C, 0x24, 0x20, 0x0E, 0x10, 0x00, 0x00]    # 561 cmp dword [esp+0x20], 0x100E（E9 入口无返回地址，id 在原 [esp]）
+        + [0x75, 0x1E]                                        # 569 jne 0x589（其余原样放行）
+        + [0x8B, 0x44, 0x24, 0x28]                            # 56B mov eax, [esp+0x28]（a3 = 包体，原 [esp+8]）
         + [0x66, 0xC7, 0x40, 0x02, 0x64, 0x00]                # 56F word [eax+0x02] = 100
         + [0xC7, 0x40, 0x25, 0x64, 0x00, 0x00, 0x00]          # 575 dword [eax+0x25] = 100
         + [0xC7, 0x40, 0x29, 0x01, 0x00, 0x00, 0x00]          # 57C dword [eax+0x29] = 1
         + [0x66, 0xC7, 0x40, 0x51, 0xB1, 0x05]                # 583 word [eax+0x51] = 0x05B1
         + [0x61]                                              # 589 popad
-        + [0xB8] + p(send_fn)                                 # 58A mov eax, 0x63C950
-        + [0xFF, 0xE0])                                       # 58F jmp eax（尾跳，栈与原 call 完全一致）
-    assert len(fix_stub_bytes) == 0x31, hex(len(fix_stub_bytes))
+        + [0x68] + p(orig_ret)                                # 58A push 调用点返回地址（补回被 E9 吃掉的 call 语义，v1048 缺此步致栈错位崩溃）
+        + [0xB8] + p(send_fn)                                 # 58F mov eax, 0x63C950
+        + [0xFF, 0xE0])                                       # 594 jmp eax（发送函数视角 = 正常 call 帧，ret 恰回调用点下一条指令）
+    assert len(fix_stub_bytes) == 0x36, hex(len(fix_stub_bytes))
     out = bytearray(0x1000)
     out[:len(code)] = code
     out[0x100:0x193] = handler
     out[0x500:0x503] = b"\x33\xC0\xC3"                        # xor eax,eax; ret
-    out[0x560:0x591] = fix_stub_bytes
+    out[0x560:0x596] = fix_stub_bytes
     return bytes(out)
 
 
@@ -1231,15 +1236,16 @@ def enter_settle_code_self_test():
          0x89, 0x88, 0xC4, 0x00, 0x00, 0x00,
          0x33, 0xC0, 0xC2, 0x10, 0x00])
     stub = bytes(
-        [0x81, 0x7C, 0x24, 0x04, 0x0E, 0x10, 0x00, 0x00,
-         0x75, 0x20,
-         0x60,
-         0x8B, 0x44, 0x24, 0x2C,
+        [0x60,
+         0x81, 0x7C, 0x24, 0x20, 0x0E, 0x10, 0x00, 0x00,
+         0x75, 0x1E,
+         0x8B, 0x44, 0x24, 0x28,
          0x66, 0xC7, 0x40, 0x02, 0x64, 0x00,
          0xC7, 0x40, 0x25, 0x64, 0x00, 0x00, 0x00,
          0xC7, 0x40, 0x29, 0x01, 0x00, 0x00, 0x00,
          0x66, 0xC7, 0x40, 0x51, 0xB1, 0x05,
          0x61,
+         0x68, 0x9D, 0x84, 0x98, 0x00,
          0xB8, 0x50, 0xC9, 0xA3, 0x00,
          0xFF, 0xE0])
     expect = (main + b"\x00" * (0x100 - len(main)) + handler
@@ -1291,23 +1297,26 @@ def enter_settle_code_self_test():
         return False
     if hins[0x190].mnemonic != 'ret' or hins[0x190].op_str != '0x10':
         return False
-    # 修正桩独立反汇编：cmp/jne/pushad/popad/4 字段写入/尾跳
-    sins = {i.address: i for i in md.disasm(code[0x560:0x591], 0x560)}
-    if sins[0x560].mnemonic != 'cmp' or sins[0x560].op_str != 'dword ptr [esp + 4], 0x100e':
+    # 修正桩独立反汇编：pushad/cmp/jne/4 字段写入/popad/补返回地址/尾跳
+    sins = {i.address: i for i in md.disasm(code[0x560:0x596], 0x560)}
+    if sins[0x560].mnemonic not in ('pushad', 'pushal'):
         return False
-    if sins[0x568].mnemonic != 'jne' or int(sins[0x568].op_str, 16) != 0x58A:
+    if sins[0x561].mnemonic != 'cmp' or sins[0x561].op_str != 'dword ptr [esp + 0x20], 0x100e':
         return False
-    if sins[0x56A].mnemonic not in ('pushad', 'pushal') \
-            or sins[0x589].mnemonic not in ('popad', 'popal'):
+    if sins[0x569].mnemonic != 'jne' or int(sins[0x569].op_str, 16) != 0x589:
         return False
-    for off, want in ((0x56B, 'eax, dword ptr [esp + 0x2c]'),
+    if sins[0x589].mnemonic not in ('popad', 'popal'):
+        return False
+    for off, want in ((0x56B, 'eax, dword ptr [esp + 0x28]'),
                       (0x56F, 'word ptr [eax + 2], 0x64'),
                       (0x575, 'dword ptr [eax + 0x25], 0x64'),
                       (0x57C, 'dword ptr [eax + 0x29], 1'),
                       (0x583, 'word ptr [eax + 0x51], 0x5b1')):
         if sins[off].mnemonic != 'mov' or sins[off].op_str != want:
             return False
-    if sins[0x58F].mnemonic != 'jmp' or sins[0x58F].op_str != 'eax':
+    if sins[0x58A].mnemonic != 'push' or sins[0x58A].op_str != '0x98849d':
+        return False
+    if sins[0x594].mnemonic != 'jmp' or sins[0x594].op_str != 'eax':
         return False
     if code[0x500:0x503] != b"\x33\xC0\xC3":
         return False
@@ -2147,7 +2156,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1048（房间内一键结算）")
+            root.title("属性助手 · 单机版 v1049（房间内一键结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
