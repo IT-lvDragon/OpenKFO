@@ -66,6 +66,17 @@ NATIVE_SETTLE_SIG = b"\x55\x8B\xEC\x81\xEC\x64\x03\x00\x00"   # 0x587E40 序言�
 NATIVE_GUARD_SIGS = ((NATIVE_STAGE_GET, b"\x55\x8B\xEC\x51"),
                      (NATIVE_IN_BATTLE, b"\x55\x8B\xEC\x51"))  # 守卫函数序言
 
+# ---- 房间内进局+结算（新版 gfld.dat 逆向，均为 RVA）----
+# 0x63EEA0 = 进局初始化：无栈参数、可独立调用；内部创建战斗管理器并写入
+# [0x17C8710]（全文件唯一写入点 0x63F5F3 在其体内），自己管理 [0x17C86F8]
+# 上下文（0x63F00A 处自写，不依赖其他函数先行）。正常流程中它经运行时才
+# 填充的调用表（.rdata 0x7330xx 区，文件态全 0）被派发，静态引用为 0，
+# 故由本工具远程线程直接调用。调用后轮询客户端三重守卫（管理器非空 +
+# 0x419120 关卡对象 + 0x4B3F0 在战斗判定）就绪即调 0x587E40 结算，一次
+# 点击一条 shellcode 完成，无任何高频轮询。
+NATIVE_ENTER_INIT = 0x63EEA0                                   # 进局初始化函数
+NATIVE_ENTER_SIG = b"\x55\x8B\xEC\x6A\xFF\x68\x12\xAA\xAD\x00"  # 0x63EEA0 序言
+
 # ---- Win32 绑定 ----
 k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
 _handle = wintypes.HANDLE
@@ -131,6 +142,8 @@ k32.CreateRemoteThread.argtypes = [_handle, ctypes.c_void_p, ctypes.c_size_t,
 k32.CreateRemoteThread.restype = _handle
 k32.TerminateThread.argtypes = [_handle, wintypes.DWORD]
 k32.TerminateThread.restype = wintypes.BOOL
+k32.GetExitCodeThread.argtypes = [_handle, ctypes.POINTER(wintypes.DWORD)]
+k32.GetExitCodeThread.restype = wintypes.BOOL
 k32.QueryFullProcessImageNameW.argtypes = [_handle, wintypes.DWORD, ctypes.c_wchar_p,
                                            ctypes.POINTER(wintypes.DWORD)]
 k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
@@ -978,15 +991,134 @@ def settle_code_self_test():
     """native_settle_code 的字节级自检：完整字节序列（ImageBase 0x400000）。"""
     code = native_settle_code(0x400000)
     expect = bytes(
-        [0xA1, 0x10, 0xC8, 0x17, 0x01, 0x85, 0xC0, 0x74, 0x10,
-         0x8B, 0x0D, 0x08, 0xC8, 0x17, 0x01,
-         0xB8, 0x20, 0x91, 0x81, 0x01, 0xFF, 0xD0, 0x85, 0xC0, 0x74, 0x1B,
+        [0xA1, 0x10, 0x87, 0x7C, 0x01, 0x85, 0xC0, 0x74, 0x10,
+         0x8B, 0x0D, 0x08, 0x87, 0x7C, 0x01,
+         0xB8, 0x20, 0x91, 0x81, 0x00, 0xFF, 0xD0, 0x85, 0xC0, 0x74, 0x1B,
          0x8B, 0xC8,
-         0xB8, 0xF0, 0xB3, 0x84, 0x01, 0xFF, 0xD0, 0x85, 0xC0, 0x74, 0x10,
-         0x6A, 0x01, 0xA1, 0x10, 0xC8, 0x17, 0x01, 0x8B, 0xC8,
-         0xB8, 0x40, 0x7E, 0x98, 0x01, 0xFF, 0xD0,
+         0xB8, 0xF0, 0xB3, 0x44, 0x00, 0xFF, 0xD0, 0x85, 0xC0, 0x74, 0x10,
+         0x6A, 0x01, 0xA1, 0x10, 0x87, 0x7C, 0x01, 0x8B, 0xC8,
+         0xB8, 0x40, 0x7E, 0x98, 0x00, 0xFF, 0xD0,
          0x33, 0xC0, 0xC2, 0x04, 0x00])
     return code == expect
+
+
+def native_enter_settle_code(base):
+    """远程线程体（房间内一键「进局+结算」）：调 0x63EEA0 进局初始化 → 有界
+    轮询客户端三重守卫 → 就绪即 push 1 + thiscall 0x587E40 结算，返回码放 eax：
+
+      1 = 已调结算（客户端发出 4110）
+      2 = 游戏管理器 [0x13C8708] 为空，无法进局
+      4 = 进局初始化已执行，但守卫超时未就绪（未创建管理器或未进战斗态）
+
+    轮询上限 300 万轮 × pause（约数秒），单条 shellcode 内完成，结束后线程
+    以 ret 4 退出。汇编布局（偏移已按实际字节核对）：
+      00 push ebx/esi; 02 esi=[mgr]; 09 [game]空→FAIL2(0x63);
+      12 call 0x63EEA0; 19 ebx=3000000;
+      1E POLL: [mgr]==0→NEXT(0x45); 27 关卡=0x419120([game]) 空→NEXT;
+      38 在战斗=0x4B3F0(关卡) 非0→DO(0x4C); 45 NEXT: dec ebx, 0→FAIL4(0x6A),
+      pause, jmp POLL; 4C DO: push 1; ecx=[mgr]; call 0x587E40; eax=1;
+      63 FAIL2: eax=2; 6A FAIL4: eax=4; 6F EXIT: pop esi/ebx; ret 4。"""
+    fn = (base + NATIVE_SETTLE_FN) & 0xFFFFFFFF
+    mgr = (base + NATIVE_SETTLE_MGR) & 0xFFFFFFFF
+    game = (base + NATIVE_GAME_MGR) & 0xFFFFFFFF
+    g1 = (base + NATIVE_STAGE_GET) & 0xFFFFFFFF
+    g2 = (base + NATIVE_IN_BATTLE) & 0xFFFFFFFF
+    ent = (base + NATIVE_ENTER_INIT) & 0xFFFFFFFF
+    p = lambda v: list(struct.pack("<I", v))
+    return bytes(
+        [0x53, 0x56]                                  # push ebx; push esi
+        + [0xA1] + p(mgr)                             # mov eax, [战斗管理器]
+        + [0x8B, 0xF0]                                # mov esi, eax（暂存旧值）
+        + [0xA1] + p(game)                            # mov eax, [游戏管理器]
+        + [0x85, 0xC0]                                # test eax, eax
+        + [0x74, 0x51]                                # je FAIL2(0x5C)
+        + [0xB8] + p(ent)                             # mov eax, 0x63EEA0
+        + [0xFF, 0xD0]                                # call eax（进局初始化）
+        + [0xBB, 0xC0, 0xC6, 0x2D, 0x00]              # mov ebx, 3000000（轮询上限）
+        + [0xA1] + p(mgr)                             # POLL: mov eax, [战斗管理器]
+        + [0x85, 0xC0]                                # test eax, eax
+        + [0x74, 0x1E]                                # je NEXT(0x3E)
+        + [0x8B, 0x0D] + p(game)                      # mov ecx, [游戏管理器]
+        + [0xB8] + p(g1)                              # mov eax, 0x419120
+        + [0xFF, 0xD0]                                # call eax -> 关卡对象
+        + [0x85, 0xC0]                                # test eax, eax
+        + [0x74, 0x0D]                                # je NEXT(0x3E)
+        + [0x8B, 0xC8]                                # mov ecx, eax
+        + [0xB8] + p(g2)                              # mov eax, 0x4B3F0
+        + [0xFF, 0xD0]                                # call eax -> 在战斗
+        + [0x85, 0xC0]                                # test eax, eax
+        + [0x75, 0x07]                                # jne DO(0x45)
+        + [0x4B]                                      # NEXT: dec ebx
+        + [0x74, 0x22]                                # jz FAIL4(0x63)
+        + [0xF3, 0x90]                                # pause
+        + [0xEB, 0xD2]                                # jmp POLL(0x17)
+        + [0x6A, 0x01]                                # DO: push 1（结算类型）
+        + [0xA1] + p(mgr)                             # mov eax, [战斗管理器]
+        + [0x8B, 0xC8]                                # mov ecx, eax（thiscall this）
+        + [0xB8] + p(fn)                              # mov eax, 0x587E40
+        + [0xFF, 0xD0]                                # call eax
+        + [0xB8, 0x01, 0x00, 0x00, 0x00]              # mov eax, 1
+        + [0xEB, 0x0C]                                # jmp EXIT(0x6F)
+        + [0xB8, 0x02, 0x00, 0x00, 0x00]              # FAIL2: mov eax, 2
+        + [0xEB, 0x05]                                # jmp EXIT(0x6F)
+        + [0xB8, 0x04, 0x00, 0x00, 0x00]              # FAIL4: mov eax, 4
+        + [0x5E]                                      # EXIT: pop esi
+        + [0x5B]                                      # pop ebx
+        + [0xC2, 0x04, 0x00])                         # ret 4
+
+
+def enter_settle_code_self_test():
+    """native_enter_settle_code 的自检：字节级比对 + capstone 语义核对
+    （每个跳转的落点指令必须是预期类型，四处 call eax 必须指向目标函数）。"""
+    code = native_enter_settle_code(0x400000)
+    expect = bytes(
+        [0x53, 0x56,
+         0xA1, 0x10, 0x87, 0x7C, 0x01, 0x8B, 0xF0,
+         0xA1, 0x08, 0x87, 0x7C, 0x01, 0x85, 0xC0, 0x74, 0x51,
+         0xB8, 0xA0, 0xEE, 0xA3, 0x00, 0xFF, 0xD0,
+         0xBB, 0xC0, 0xC6, 0x2D, 0x00,
+         0xA1, 0x10, 0x87, 0x7C, 0x01, 0x85, 0xC0, 0x74, 0x1E,
+         0x8B, 0x0D, 0x08, 0x87, 0x7C, 0x01,
+         0xB8, 0x20, 0x91, 0x81, 0x00, 0xFF, 0xD0, 0x85, 0xC0, 0x74, 0x0D,
+         0x8B, 0xC8,
+         0xB8, 0xF0, 0xB3, 0x44, 0x00, 0xFF, 0xD0, 0x85, 0xC0, 0x75, 0x07,
+         0x4B, 0x74, 0x22, 0xF3, 0x90, 0xEB, 0xD2,
+         0x6A, 0x01, 0xA1, 0x10, 0x87, 0x7C, 0x01, 0x8B, 0xC8,
+         0xB8, 0x40, 0x7E, 0x98, 0x00, 0xFF, 0xD0,
+         0xB8, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x0C,
+         0xB8, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x05,
+         0xB8, 0x04, 0x00, 0x00, 0x00,
+         0x5E, 0x5B, 0xC2, 0x04, 0x00])
+    if code != expect:
+        return False
+    try:
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+    except ImportError:
+        return True                      # 构建机无 capstone 时仅做字节比对
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    ins = {i.address: i for i in md.disasm(code, 0)}
+    # call eax 本身 op_str 是寄存器，目标看前一条 mov eax, imm32
+    for call_off, fn in ((0x17, 0xA3EEA0), (0x32, 0x819120),
+                         (0x3F, 0x44B3F0), (0x5A, 0x987E40)):
+        if ins[call_off].mnemonic != 'call' or ins[call_off].op_str != 'eax':
+            return False
+        loader = ins[call_off - 5]               # mov eax, imm32
+        if loader.mnemonic != 'mov' or not loader.op_str.endswith(', ' + hex(fn)):
+            return False
+    # 跳转落点语义核对：(偏移, 期望助记符, 期望落点助记符)
+    for off, mn, tgt_mn in ((0x10, 'je', 'mov'), (0x25, 'je', 'dec'),
+                            (0x36, 'je', 'dec'), (0x43, 'jne', 'push'),
+                            (0x46, 'je', 'mov'), (0x4A, 'jmp', 'mov'),
+                            (0x61, 'jmp', 'pop'), (0x68, 'jmp', 'pop')):
+        i = ins[off]
+        if i.mnemonic != mn:
+            return False
+        tgt = int(i.op_str, 16)
+        if tgt not in ins or ins[tgt].mnemonic != tgt_mn:
+            return False
+    if ins[0x71].mnemonic != 'ret' or ins[0x71].op_str != '4':
+        return False
+    return True
 
 
 # ---- 结算重放：钩住发包函数抓包，改字节后经原生 send 原样重发 ----
@@ -1759,6 +1891,9 @@ def self_test():
         and sp2[:0x43] == bytes(stm2[:0x43]) and sp2[0x4B:] == bytes(stm2[0x4B:])
     ok = ok and make_settle_payload(b"\x00" * 4, new8)[0] is None   # 模板过短
 
+    # 远程线程 shellcode 自检（字节级 + capstone 语义核对，无 capstone 时仅字节）
+    ok = ok and settle_code_self_test() and enter_settle_code_self_test()
+
     k32.VirtualFree(buffer, 0, MEM_RELEASE)
     print("self-test:", "ok" if ok else "FAILED")
     return 0 if ok else 2
@@ -1806,7 +1941,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1040（开局速通）")
+            root.title("属性助手 · 单机版 v1041（房间内进局结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2096,6 +2231,8 @@ def run_ui():
             self.settle_tmpl_box.bind("<<ComboboxSelected>>", self.on_settle_tmpl_pick)
             ttk.Button(trow, text="原生结算",
                        command=self.native_settle).pack(side="left", padx=(8, 0))
+            ttk.Button(trow, text="房间进局结算",
+                       command=self.native_enter_settle).pack(side="left", padx=(8, 0))
             ttk.Checkbutton(srow, text="自动结算", variable=self.settle_auto_var
                             ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="自动原生结算", variable=self.native_auto_var
@@ -3301,6 +3438,73 @@ def run_ui():
                     self.native_msg = self.native_settle_impl()
                 except Exception as exc:              # 任何异常都不许拖死勾选循环
                     self.native_msg = f"原生结算异常：{exc}"
+                finally:
+                    self.native_busy = False
+            threading.Thread(target=worker, daemon=True).start()
+
+        def native_enter_settle_impl(self):
+            """房间内一键「进局+结算」同步实现：单条 shellcode 依次完成
+            0x63EEA0 进局初始化 → 守卫就绪轮询 → 0x587E40 结算。
+            返回结果消息字符串（含线程返回码翻译）。"""
+            handle, base = self.handle, self.base
+            for off, want in ((NATIVE_ENTER_INIT, NATIVE_ENTER_SIG),
+                              (NATIVE_SETTLE_FN, NATIVE_SETTLE_SIG),
+                              *NATIVE_GUARD_SIGS):
+                if read_mem(handle, base + off, len(want)) != want:
+                    return "当前客户端不是新版（进局/结算函数序言不符），房间进局结算不可用。"
+            if not read_u32(handle, base + NATIVE_GAME_MGR):
+                return "游戏管理器为空：客户端状态异常，无法进局。"
+            block = k32.VirtualAllocEx(handle, None, 4096, MEM_COMMIT_RESERVE,
+                                       PAGE_READWRITE) or 0
+            if not block:
+                return f"远程内存分配失败（{ctypes.get_last_error()}）。"
+            code = native_enter_settle_code(base)
+            got = ctypes.c_size_t(0)
+            ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block), code,
+                                             len(code), ctypes.byref(got))) \
+                and got.value == len(code)
+            if ok:
+                previous = wintypes.DWORD(0)
+                ok = bool(k32.VirtualProtectEx(handle, ctypes.c_void_p(block), 4096,
+                                               PAGE_EXECUTE_READ, ctypes.byref(previous)))
+                k32.FlushInstructionCache(handle, ctypes.c_void_p(block), len(code))
+            thread = 0
+            if ok:
+                thread = k32.CreateRemoteThread(handle, None, 0, ctypes.c_void_p(block),
+                                                None, 0, None) or 0
+            if not thread:
+                k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+                return f"远程线程创建失败（{ctypes.get_last_error()}）。"
+            wait = k32.WaitForSingleObject(thread, 20000)
+            exit_code = wintypes.DWORD(0)
+            k32.GetExitCodeThread(thread, ctypes.byref(exit_code))
+            k32.CloseHandle(thread)
+            k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
+            if wait == WAIT_TIMEOUT or exit_code.value == 259:   # 259 = STILL_ACTIVE
+                return ("进局初始化仍在执行（可能正在加载）：请等几秒后再点一次"
+                        "「房间进局结算」，或直接点「原生结算」。")
+            return {1: "进局+结算完成：客户端已发出 4110。",
+                    2: "进局中止：游戏管理器为空。",
+                    4: ("进局初始化已执行，但战斗状态未就绪（超时）。"
+                        "客户端若已开始进图请稍候再点一次。"),
+                    }.get(exit_code.value, f"进局+结算返回未知码 {exit_code.value}。")
+
+        def native_enter_settle(self):
+            """房间内进局+结算：后台线程执行，避免远程调用卡 UI。"""
+            if not self.handle or not self.base:
+                self.replay_status.set("未连接游戏进程。")
+                return
+            if self.native_busy:
+                self.replay_status.set("上一次原生操作尚未结束，请稍候。")
+                return
+            self.native_busy = True
+            self.replay_status.set("正在房间内进局并结算（单次尝试）……")
+
+            def worker():
+                try:
+                    self.native_msg = self.native_enter_settle_impl()
+                except Exception as exc:
+                    self.native_msg = f"房间进局结算异常：{exc}"
                 finally:
                     self.native_busy = False
             threading.Thread(target=worker, daemon=True).start()

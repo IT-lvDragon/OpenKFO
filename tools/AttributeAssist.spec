@@ -24,6 +24,7 @@ exe = EXE(
     [],
     name='AttributeAssist',
     debug=False,
+    icon='NONE',   # wine 构建环境不支持 EndUpdateResourceW，跳过默认图标嵌入
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
