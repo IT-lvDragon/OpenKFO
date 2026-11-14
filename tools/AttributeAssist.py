@@ -1806,7 +1806,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1039（结算防崩溃）")
+            root.title("属性助手 · 单机版 v1040（开局速通）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2024,6 +2024,8 @@ def run_ui():
             self.native_seen_battle = False                      # 本局是否已见过战斗管理器非空
             self.native_enter_ts = 0                             # 管理器首次非空时间（进图延迟计时）
             self.native_last_ts = 0                              # 上次自动原生结算时间
+            self.native_rush_left = 0                            # 开局速通剩余尝试次数
+            self.native_4110_base = 0                            # 速通起点时已有的我发 4110 计数
             self.native_busy = False                             # 原生结算后台线程进行中
             self.native_msg = None                               # 后台线程完成后待上屏的消息
             self.settle_last_token = None                        # 上次直接结算已发的 token
@@ -3283,7 +3285,7 @@ def run_ui():
             k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
             return result
 
-        def native_settle(self):
+        def native_settle(self, quiet=False):
             """手动原生结算：后台线程执行，避免远程调用卡 UI。"""
             if not self.handle or not self.base:
                 self.replay_status.set("未连接游戏进程。")
@@ -3292,7 +3294,8 @@ def run_ui():
                 self.replay_status.set("上一次原生结算尚未结束，请稍候。")
                 return
             self.native_busy = True
-            self.replay_status.set("正在调用原生结算……")
+            if not quiet:
+                self.replay_status.set("正在调用原生结算……")
 
             def worker():
                 try:
@@ -3304,24 +3307,50 @@ def run_ui():
             threading.Thread(target=worker, daemon=True).start()
 
         def native_auto_tick(self):
-            """自动原生结算：进图（管理器非空）后延迟 2.5 秒调用一次，一局一次。
-            PVP 房服务器接受、闯关房拒收（实测均不掉线），全模式开启无副作用。"""
+            """自动原生结算（开局速通）：战斗管理器一出现（进图初始化开始，客户端
+            通常还在加载画面）即进入速通窗口，每 200ms 调一次远程线程；shellcode
+            内置客户端同款「在战斗中」守卫，未就绪时空跑无害，守卫一过 4110 立即
+            发出（= 最早可结算时刻，加载不等待）。抓到新的我发 4110 或窗口耗尽
+            （约 10 秒）后停止；若整局从未发出，窗口结束后回落为延迟 2.5 秒的
+            常规一次。PVP/训练房可提前结算，闯关房守卫通过但条件未满足时服务器
+            静默拒收（实测不掉线），全模式开启无副作用。"""
             if self.native_msg:
                 self.replay_status.set(self.native_msg)
                 self.native_msg = None
             if not self.native_auto_var.get() or not self.handle or not self.base:
                 return
-            if self.native_busy:
-                return
             mgr = read_u32(self.handle, self.base + NATIVE_SETTLE_MGR)
             if not mgr:
-                self.native_seen_battle = False       # 出图复位，下一局重新计时
+                self.native_seen_battle = False       # 出图复位，下一局重新速通
+                self.native_rush_left = 0
                 return
             now = now_ms()
             if not self.native_seen_battle:
-                self.native_seen_battle = True        # 记进图时刻，延迟后触发
+                self.native_seen_battle = True
                 self.native_enter_ts = now
+                self.native_4110_base = sum(1 for r in self.packets
+                                            if r.get("mine") and r["id"] == 4110)
+                self.native_rush_left = 50            # 50 × 200ms ≈ 10 秒速通窗口
                 return
+            if self.native_rush_left > 0:
+                if self.native_busy or now - self.native_last_ts < 200:
+                    return
+                sent = sum(1 for r in self.packets
+                           if r.get("mine") and r["id"] == 4110)
+                if sent > self.native_4110_base:      # 4110 已发出 = 速通成功
+                    self.native_rush_left = 0
+                    self.replay_status.set("开局速通：客户端已发出 4110 结算包。")
+                    return
+                self.native_rush_left -= 1
+                self.native_last_ts = now
+                self.replay_status.set(f"开局速通：等待客户端就绪（剩 {self.native_rush_left} 次尝试）……")
+                self.native_settle(quiet=True)        # 守卫未过时空跑，无害
+                return
+            if self.native_busy:
+                return
+            if sum(1 for r in self.packets
+                   if r.get("mine") and r["id"] == 4110) > self.native_4110_base:
+                return                                 # 本局已发出过，绝不重复（重复 4110 有掉线风险）
             if now - self.native_enter_ts < 2500 or now - self.native_last_ts < 6000:
                 return
             self.native_busy = True
