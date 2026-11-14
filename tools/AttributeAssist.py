@@ -79,6 +79,19 @@ NATIVE_GUARD_SIGS = ((NATIVE_STAGE_GET, b"\x55\x8B\xEC\x51"),
 NATIVE_ENTER_INIT = 0x63EEA0                                   # （已弃用，仅存档）进局初始化函数
 NATIVE_ENTER_SIG = b"\x55\x8B\xEC\x6A\xFF\x68\x12\xAA\xAD\x00"  # 0x63EEA0 序言（版本判定用）
 
+# ---- 4110 发送拦截修正（v1048）----
+# 包内容 = 8×0x57 战绩记录（696 字节整包，无独立包头）。房间内与局内实测只差
+# 记录 0 的 4 个字段：+0x02 word（100/0）、+0x25 dword（100/4）、+0x29 dword
+# （1/4）、+0x51 word（0x5B1/0x11C6）；+0x00 word 两态都是 100 无需处理。差异
+# 字段来自运行时解密区的 actor getter（0x9e3c70/0x9e3cd0/0x9e45b0），静态不可
+# 读，故在发送点拦截修正：0x587E40 内唯一一条 call 0x63C950（E8）临时改 E9 →
+# 修正桩——桩只拦 id=0x100E 的包、把 4 个字段改成局内已验证值，其余包原样
+# 放行，尾跳 0x63C950 正常发送；返回后（含异常清理路径）恢复 E8 原 5 字节。
+# 0x63C950 本体不动，其他网络流量不受影响；.text 页由工具先 VirtualProtectEx。
+NATIVE_SEND_FN = 0x63C950             # 4110 发送函数 cdecl(id, a2, buf, len)
+NATIVE_SEND_CALL = 0x588498           # 0x587E40 内唯一一条 call 0x63C950
+NATIVE_SEND_CALL_SIG = b"\xE8\xB3\x44\x0B\x00"   # 调用点原 5 字节（版本判定）
+
 # ---- Win32 绑定 ----
 k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
 _handle = wintypes.HANDLE
@@ -1005,31 +1018,46 @@ def settle_code_self_test():
 
 
 def native_enter_settle_code(base, buf):
-    """远程线程体（房间内一键结算，v1047：SEH 保护 + 动态装假战绩对象）。
+    """远程线程体（房间内一键结算，v1048：假战绩对象 + 4110 发送点拦截修正）。
 
     0x587E40 结算函数开头经 0x53DB0 取 [mgr]+0xAC（对局结果对象 A）再虚调用
     A->vtbl[0x98] 得战绩容器 B；B==0 时函数走零值路径照常拼包。战斗管理器是
     堆对象（[0x13C8710] 存指针，字段在运行时地址 [mgr]+0xAC），该字段当前是
-    垃圾指针（v1044 实测崩点 0x587E85）。房间内管理器本就非空且稳定（三次
-    实测同一值），故本版不再调用 0x63EEA0 进局初始化——v1046 实测它在房间内
-    崩溃于动态内存（内部运行时调用表未就绪），改为直接装假对象调结算：
-    按 [mgr] 把假对象写入字段（A(buf+0x300)→虚表(buf+0x400)，虚表+0x98 槽为
-    `xor eax,eax; ret` (buf+0x500)）→ 调结算 → 恢复字段原值。
+    垃圾指针（v1044 实测崩点 0x587E85）。房间内管理器本就非空且稳定，直接装
+    假对象调结算（A(buf+0x300)→虚表(buf+0x400)，虚表+0x98 槽为
+    `xor eax,eax; ret` (buf+0x500)）。
+
+    v1048 新增发送点拦截修正：房间内发出的 4110 与局内合法包差记录 0 的 4 个
+    字段（+0x02 word / +0x25 dword / +0x29 dword / +0x51 word，来自运行时解密
+    区的 actor getter，无法静态补造），服务器只验包内容并静默拒收不合格包。
+    故在调结算前把 0x587E40 内唯一一条 call 0x63C950（0x588498，E8）临时改成
+    E9 跳到修正桩（buf+0x560）：桩只拦 id=0x100E 的包，pushad 后把 4 个字段
+    改成局内已验证值再 popad，尾跳 0x63C950 正常发送；结算返回后（含 SEH
+    清理路径）恢复 E8 原 8 字节（暂存 buf+0x510）。0x63C950 本体不动，其他
+    网络流量不受影响。
+
     异常时 SEH 处理器把寄存器快照 + 异常码/异常地址/CTX 指针写回缓冲区
     尾部，把 Context 的 Eip/Esp 改到清理路径，线程正常退出、客户端不崩。
     缓冲区布局（base=ImageBase 用于游戏地址，buf=缓冲区绝对地址用于自身数据）：
-      +0x000 主流程（0xB9 字节）   +0x100 SEH 处理器（0x93 字节）
+      +0x000 主流程（0xF4 字节）   +0x100 SEH 处理器（0x93 字节）
       +0x1F4 原始 SEH 链           +0x1F8 安装时 ESP
       +0x200 快照 0x30 字节（Eip Eax Ecx Edx Ebx Esi Edi Ebp Esp | CTX 异常码 异常地址）
       +0x2F0 [mgr]+0xAC 原值暂存  +0x300 假对象 A   +0x400 假虚表
-      +0x500 xor eax,eax; ret
-    流程：[mgr] 空（兜底）返回 2 → 装假对象 → push 1 + thiscall 0x587E40
-    结算 → 恢复 [mgr]+0xAC。返回码：
-      1 = 已调结算（客户端发出 4110）
+      +0x500 xor eax,eax; ret     +0x510 E8 原 8 字节暂存
+      +0x560 4110 字段修正桩（0x31 字节）
+    流程：[mgr] 空（未战斗）返回 2（此路径未做任何补丁，无需恢复）→ 暂存并
+    补丁发送调用点 → 装假对象 → push 1 + thiscall 0x587E40 结算（4110 经桩
+    修正后发出）→ 恢复 [mgr]+0xAC → 恢复调用点原字节。返回码：
+      1 = 已调结算（客户端发出修正后的 4110）
       2 = 战斗管理器 [0x13C8710] 为空
-      5 = 异常已拦截（快照可读，工具翻译成定位信息）"""
+      5 = 异常已拦截（快照可读，工具翻译成定位信息；调用点已恢复）"""
     mgr = (base + NATIVE_SETTLE_MGR) & 0xFFFFFFFF
     fn = (base + NATIVE_SETTLE_FN) & 0xFFFFFFFF
+    call_site = (base + NATIVE_SEND_CALL) & 0xFFFFFFFF
+    send_fn = (base + NATIVE_SEND_FN) & 0xFFFFFFFF
+    fix_stub = (buf + 0x560) & 0xFFFFFFFF
+    save8 = (buf + 0x510) & 0xFFFFFFFF
+    rel32 = (fix_stub - call_site - 5) & 0xFFFFFFFF   # E9 rel32 → 修正桩
     fake_a = (buf + 0x300) & 0xFFFFFFFF
     fake_vt = (buf + 0x400) & 0xFFFFFFFF
     fake_stub = (buf + 0x500) & 0xFFFFFFFF
@@ -1047,36 +1075,50 @@ def native_enter_settle_code(base, buf):
         + [0x64, 0xFF, 0x35, 0, 0, 0, 0]                      # 13 push dword fs:[0]
         + [0x64, 0x89, 0x25, 0, 0, 0, 0]                      # 1A mov fs:[0], esp（装帧）
         + [0x89, 0x25] + p(se)                                # 21 mov [SE], esp（恢复用）
-        + [0x83, 0x3D] + p(mgr) + [0x00]                      # 27 cmp dword [mgr], 0（房间内本非空，兜底）
-        + [0x0F, 0x84] + p(0x57)                              # 2E je FAIL2(0x8B)
-        + [0xA1] + p(mgr)                                     # 34 GOT: mov eax, [mgr]（管理器指针）
-        + [0x8B, 0x90, 0xAC, 0, 0, 0]                         # 39 mov edx, [eax+0xAC]（disp32！disp8 0xAC 会符号扩展成 -0x54）
-        + [0x89, 0x15] + p(save)                              # 3F mov [SAVE], edx
-        + [0xC7, 0x80, 0xAC, 0, 0, 0] + p(fake_a)             # 45 mov dword [eax+0xAC], FAKE_A
-        + [0xC7, 0x05] + p(fake_a) + p(fake_vt)               # 4F A→虚表
-        + [0xC7, 0x05] + p(fake_vt + 0x98) + p(fake_stub)     # 59 虚表+0x98 → stub
-        + [0x6A, 0x01]                                        # 63 DO: push 1（结算类型）
-        + [0xA1] + p(mgr)                                     # 65 mov eax, [mgr]
-        + [0x8B, 0xC8]                                        # 6A mov ecx, eax（thiscall this）
-        + [0xB8] + p(fn)                                      # 6C mov eax, 0x587E40
-        + [0xFF, 0xD0]                                        # 71 call eax
-        + [0xA1] + p(mgr)                                     # 73 mov eax, [mgr]
-        + [0x8B, 0x0D] + p(save)                              # 78 mov ecx, [SAVE]
-        + [0x89, 0x88, 0xAC, 0, 0, 0]                         # 7E 恢复 [mgr+0xAC] 原值
-        + [0xB8, 0x01, 0x00, 0x00, 0x00]                      # 84 mov eax, 1
-        + [0xEB, 0x18]                                        # 89 jmp EXIT(0xA3)
-        + [0xB8, 0x02, 0x00, 0x00, 0x00]                      # 8B FAIL2: mov eax, 2
-        + [0xEB, 0x11]                                        # 90 jmp EXIT
-        + [0x90, 0x90]                                        # 92 pad → 0x94
-        + [0xB8, 0x05, 0x00, 0x00, 0x00]                      # 94 CLEANUP: mov eax, 5
-        + [0xEB, 0x08]                                        # 99 jmp EXIT
-        + [0x90] * 8                                          # 9B pad → 0xA3
-        + [0x8B, 0x0D] + p(orig)                              # A3 EXIT: mov ecx, [ORIG]
-        + [0x64, 0x89, 0x0D, 0, 0, 0, 0]                      # A9 mov fs:[0], ecx（卸帧）
-        + [0x83, 0xC4, 0x08]                                  # B0 add esp, 8
-        + [0x5F, 0x5E, 0x5B]                                  # B3 pop edi; esi; ebx
-        + [0xC2, 0x04, 0x00])                                 # B6 ret 4
-    assert len(code) == 0xB9, hex(len(code))
+        + [0x83, 0x3D] + p(mgr) + [0x00]                      # 27 cmp dword [mgr], 0（先判空：FAIL2 路径未做任何补丁）
+        + [0x0F, 0x84] + p(0x8C)                              # 2E je FAIL2(0xC0)
+        + [0xBE] + p(call_site)                               # 34 mov esi, 发送调用点（0x588498）
+        + [0xBF] + p(save8)                                   # 39 mov edi, E8 暂存区
+        + [0xB9, 0x08, 0x00, 0x00, 0x00]                      # 3E mov ecx, 8
+        + [0xFC]                                              # 43 cld
+        + [0xF3, 0xA4]                                        # 44 rep movsb（保存调用点原 8 字节）
+        + [0xC6, 0x05] + p(call_site) + [0xE9]                # 46 mov byte [call_site], 0xE9
+        + [0xC7, 0x05] + p(call_site + 1) + p(rel32)          # 4D mov dword [call_site+1], rel32（E9 → 修正桩）
+        + [0xA1] + p(mgr)                                     # 57 GOT: mov eax, [mgr]（管理器指针）
+        + [0x8B, 0x90, 0xAC, 0, 0, 0]                         # 5C mov edx, [eax+0xAC]（disp32！disp8 0xAC 会符号扩展成 -0x54）
+        + [0x89, 0x15] + p(save)                              # 62 mov [SAVE], edx
+        + [0xC7, 0x80, 0xAC, 0, 0, 0] + p(fake_a)             # 68 mov dword [eax+0xAC], FAKE_A
+        + [0xC7, 0x05] + p(fake_a) + p(fake_vt)               # 72 A→虚表
+        + [0xC7, 0x05] + p(fake_vt + 0x98) + p(fake_stub)     # 7C 虚表+0x98 → stub
+        + [0x6A, 0x01]                                        # 86 push 1（结算类型）
+        + [0xA1] + p(mgr)                                     # 88 mov eax, [mgr]
+        + [0x8B, 0xC8]                                        # 8D mov ecx, eax（thiscall this）
+        + [0xB8] + p(fn)                                      # 8F mov eax, 0x587E40
+        + [0xFF, 0xD0]                                        # 94 call eax（4110 经修正桩发出）
+        + [0xA1] + p(mgr)                                     # 96 mov eax, [mgr]
+        + [0x8B, 0x0D] + p(save)                              # 9B mov ecx, [SAVE]
+        + [0x89, 0x88, 0xAC, 0, 0, 0]                         # A1 恢复 [mgr+0xAC] 原值
+        + [0xBE] + p(save8)                                   # A7 mov esi, E8 暂存区
+        + [0xBF] + p(call_site)                               # AC mov edi, 发送调用点
+        + [0xB9, 0x08, 0x00, 0x00, 0x00]                      # B1 mov ecx, 8
+        + [0xFC]                                              # B6 cld
+        + [0xF3, 0xA4]                                        # B7 rep movsb（恢复 E8 原 8 字节）
+        + [0xB8, 0x01, 0x00, 0x00, 0x00]                      # B9 mov eax, 1
+        + [0xEB, 0x1E]                                        # BE jmp EXIT(0xDE)
+        + [0xB8, 0x02, 0x00, 0x00, 0x00]                      # C0 FAIL2: mov eax, 2
+        + [0xEB, 0x17]                                        # C5 jmp EXIT
+        + [0xB8, 0x05, 0x00, 0x00, 0x00]                      # C7 CLEANUP: mov eax, 5
+        + [0xBE] + p(save8)                                   # CC mov esi, E8 暂存区
+        + [0xBF] + p(call_site)                               # D1 mov edi, 发送调用点
+        + [0xB9, 0x08, 0x00, 0x00, 0x00]                      # D6 mov ecx, 8
+        + [0xFC]                                              # DB cld
+        + [0xF3, 0xA4]                                        # DC rep movsb（异常路径也恢复调用点）
+        + [0x8B, 0x0D] + p(orig)                              # DE EXIT: mov ecx, [ORIG]
+        + [0x64, 0x89, 0x0D, 0, 0, 0, 0]                      # E4 mov fs:[0], ecx（卸帧）
+        + [0x83, 0xC4, 0x08]                                  # EB add esp, 8
+        + [0x5F, 0x5E, 0x5B]                                  # EE pop edi; esi; ebx
+        + [0xC2, 0x04, 0x00])                                 # F1 ret 4
+    assert len(code) == 0xF4, hex(len(code))
     handler = bytes(
         [0x8B, 0x44, 0x24, 0x0C]                              # 100 mov eax, [esp+0xC]（ContextRecord）
         + [0x89, 0x05] + p(dump + 0x24)                       # 104 记录 CTX 指针本身
@@ -1096,22 +1138,37 @@ def native_enter_settle_code(base, buf):
         + [0x8B, 0x88, 0x9C, 0, 0, 0] + [0x89, 0x47, 0x18]    # 15D Edi(0x9C)
         + [0x8B, 0x88, 0xB4, 0, 0, 0] + [0x89, 0x47, 0x1C]    # 166 Ebp(0xB4)
         + [0x8B, 0x88, 0xC4, 0, 0, 0] + [0x89, 0x47, 0x20]    # 16F Esp(0xC4)
-        + [0xC7, 0x80, 0xB8, 0, 0, 0] + p(buf + 0x94)         # 178 Context->Eip = CLEANUP(0x94)
+        + [0xC7, 0x80, 0xB8, 0, 0, 0] + p(buf + 0xC7)         # 178 Context->Eip = CLEANUP(0xC7)
         + [0x8B, 0x0D] + p(se)                                # 182 mov ecx, [SE]
         + [0x89, 0x88, 0xC4, 0, 0, 0]                         # 188 Context->Esp = SE
         + [0x33, 0xC0]                                        # 18E xor eax, eax（继续执行）
         + [0xC2, 0x10, 0x00])                                 # 190 ret 16
     assert len(handler) == 0x93, hex(len(handler))
+    fix_stub_bytes = bytes(
+        [0x81, 0x7C, 0x24, 0x04, 0x0E, 0x10, 0x00, 0x00]      # 560 cmp dword [esp+4], 0x100E（只拦 4110）
+        + [0x75, 0x20]                                        # 568 jne 0x58A（其余原样放行）
+        + [0x60]                                              # 56A pushad
+        + [0x8B, 0x44, 0x24, 0x2C]                            # 56B mov eax, [esp+0x2C]（a3 = 包体）
+        + [0x66, 0xC7, 0x40, 0x02, 0x64, 0x00]                # 56F word [eax+0x02] = 100
+        + [0xC7, 0x40, 0x25, 0x64, 0x00, 0x00, 0x00]          # 575 dword [eax+0x25] = 100
+        + [0xC7, 0x40, 0x29, 0x01, 0x00, 0x00, 0x00]          # 57C dword [eax+0x29] = 1
+        + [0x66, 0xC7, 0x40, 0x51, 0xB1, 0x05]                # 583 word [eax+0x51] = 0x05B1
+        + [0x61]                                              # 589 popad
+        + [0xB8] + p(send_fn)                                 # 58A mov eax, 0x63C950
+        + [0xFF, 0xE0])                                       # 58F jmp eax（尾跳，栈与原 call 完全一致）
+    assert len(fix_stub_bytes) == 0x31, hex(len(fix_stub_bytes))
     out = bytearray(0x1000)
     out[:len(code)] = code
     out[0x100:0x193] = handler
     out[0x500:0x503] = b"\x33\xC0\xC3"                        # xor eax,eax; ret
+    out[0x560:0x591] = fix_stub_bytes
     return bytes(out)
 
 
 def enter_settle_code_self_test():
     """native_enter_settle_code 自检：字节级比对（buf=0 时全部绝对地址确定）
-    + capstone 语义核对（SEH 恢复链、跳转落点、call 目标、假对象装配、处理器尾部）。"""
+    + capstone 语义核对（SEH 恢复链、跳转落点、E9 补丁与 rel32、修正桩、
+    call 目标、假对象装配、处理器尾部）。"""
     code = native_enter_settle_code(0x400000, 0)
     main = bytes(
         [0x53, 0x56, 0x57,
@@ -1121,7 +1178,14 @@ def enter_settle_code_self_test():
          0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00,
          0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00,
          0x89, 0x25, 0xF8, 0x01, 0x00, 0x00,
-         0x83, 0x3D, 0x10, 0x87, 0x7C, 0x01, 0x00, 0x0F, 0x84, 0x57, 0x00, 0x00, 0x00,
+         0x83, 0x3D, 0x10, 0x87, 0x7C, 0x01, 0x00,
+         0x0F, 0x84, 0x8C, 0x00, 0x00, 0x00,
+         0xBE, 0x98, 0x84, 0x98, 0x00,
+         0xBF, 0x10, 0x05, 0x00, 0x00,
+         0xB9, 0x08, 0x00, 0x00, 0x00,
+         0xFC, 0xF3, 0xA4,
+         0xC6, 0x05, 0x98, 0x84, 0x98, 0x00, 0xE9,
+         0xC7, 0x05, 0x99, 0x84, 0x98, 0x00, 0xC3, 0x80, 0x67, 0xFF,
          0xA1, 0x10, 0x87, 0x7C, 0x01,
          0x8B, 0x90, 0xAC, 0x00, 0x00, 0x00, 0x89, 0x15, 0xF0, 0x02, 0x00, 0x00,
          0xC7, 0x80, 0xAC, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
@@ -1131,11 +1195,17 @@ def enter_settle_code_self_test():
          0xB8, 0x40, 0x7E, 0x98, 0x00, 0xFF, 0xD0,
          0xA1, 0x10, 0x87, 0x7C, 0x01, 0x8B, 0x0D, 0xF0, 0x02, 0x00, 0x00,
          0x89, 0x88, 0xAC, 0x00, 0x00, 0x00,
-         0xB8, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x18,
-         0xB8, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x11,
-         0x90, 0x90,
-         0xB8, 0x05, 0x00, 0x00, 0x00, 0xEB, 0x08,
-         0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+         0xBE, 0x10, 0x05, 0x00, 0x00,
+         0xBF, 0x98, 0x84, 0x98, 0x00,
+         0xB9, 0x08, 0x00, 0x00, 0x00,
+         0xFC, 0xF3, 0xA4,
+         0xB8, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x1E,
+         0xB8, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x17,
+         0xB8, 0x05, 0x00, 0x00, 0x00,
+         0xBE, 0x10, 0x05, 0x00, 0x00,
+         0xBF, 0x98, 0x84, 0x98, 0x00,
+         0xB9, 0x08, 0x00, 0x00, 0x00,
+         0xFC, 0xF3, 0xA4,
          0x8B, 0x0D, 0xF4, 0x01, 0x00, 0x00,
          0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00,
          0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0xC2, 0x04, 0x00])
@@ -1156,13 +1226,26 @@ def enter_settle_code_self_test():
          0x8B, 0x88, 0x9C, 0x00, 0x00, 0x00, 0x89, 0x47, 0x18,
          0x8B, 0x88, 0xB4, 0x00, 0x00, 0x00, 0x89, 0x47, 0x1C,
          0x8B, 0x88, 0xC4, 0x00, 0x00, 0x00, 0x89, 0x47, 0x20,
-         0xC7, 0x80, 0xB8, 0x00, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00,
+         0xC7, 0x80, 0xB8, 0x00, 0x00, 0x00, 0xC7, 0x00, 0x00, 0x00,
          0x8B, 0x0D, 0xF8, 0x01, 0x00, 0x00,
          0x89, 0x88, 0xC4, 0x00, 0x00, 0x00,
          0x33, 0xC0, 0xC2, 0x10, 0x00])
+    stub = bytes(
+        [0x81, 0x7C, 0x24, 0x04, 0x0E, 0x10, 0x00, 0x00,
+         0x75, 0x20,
+         0x60,
+         0x8B, 0x44, 0x24, 0x2C,
+         0x66, 0xC7, 0x40, 0x02, 0x64, 0x00,
+         0xC7, 0x40, 0x25, 0x64, 0x00, 0x00, 0x00,
+         0xC7, 0x40, 0x29, 0x01, 0x00, 0x00, 0x00,
+         0x66, 0xC7, 0x40, 0x51, 0xB1, 0x05,
+         0x61,
+         0xB8, 0x50, 0xC9, 0xA3, 0x00,
+         0xFF, 0xE0])
     expect = (main + b"\x00" * (0x100 - len(main)) + handler
               + b"\x00" * (0x500 - 0x100 - len(handler))
-              + b"\x33\xC0\xC3" + b"\x00" * (0x1000 - 0x503))
+              + b"\x33\xC0\xC3" + b"\x00" * (0x560 - 0x503)
+              + stub + b"\x00" * (0x1000 - 0x560 - len(stub)))
     if len(code) != 0x1000 or code != expect:
         return False
     try:
@@ -1172,37 +1255,59 @@ def enter_settle_code_self_test():
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     ins = {i.address: i for i in md.disasm(code, 0)}   # 全量（含 0x100 处理器）
     # call eax 本身 op_str 是寄存器，目标看前一条 mov eax, imm32
-    for call_off, ld_off, fn in ((0x71, 0x6C, 0x987E40),):
+    for call_off, ld_off, fn in ((0x94, 0x8F, 0x987E40),):
         if ins[call_off].mnemonic != 'call' or ins[call_off].op_str != 'eax':
             return False
         loader = ins[ld_off]
         if loader.mnemonic != 'mov' or not loader.op_str.endswith(', ' + hex(fn)):
             return False
+    # E9 补丁写入与 rel32：capstone 把 imm 渲染成无符号大数，直接锁字节
+    if code[0x46:0x4D] != b"\xC6\x05\x98\x84\x98\x00\xE9" \
+            or code[0x4D:0x57] != b"\xC7\x05\x99\x84\x98\x00\xC3\x80\x67\xFF":
+        return False
     # 跳转落点语义核对：(偏移, 期望助记符, 期望落点偏移, 落点助记符)
     for off, mn, tgt, tgt_mn in (
-            (0x2E, 'je', 0x8B, 'mov'), (0x89, 'jmp', 0xA3, 'mov'),
-            (0x90, 'jmp', 0xA3, 'mov'), (0x99, 'jmp', 0xA3, 'mov')):
+            (0x2E, 'je', 0xC0, 'mov'), (0xBE, 'jmp', 0xDE, 'mov'),
+            (0xC5, 'jmp', 0xDE, 'mov')):
         i = ins[off]
         if i.mnemonic != mn or int(i.op_str, 16) != tgt or ins[tgt].mnemonic != tgt_mn:
             return False
     # 假对象装配与恢复（字段在运行时地址 [mgr]+0xAC；capstone 会把 disp8 0xAC
     # 渲染成 [eax - 0x54]，故断言同时锁死 disp32 编码后的正确形式）
-    for off, want in ((0x39, 'edx, dword ptr [eax + 0xac]'),
-                      (0x4F, 'dword ptr [0x300], 0x400'),
-                      (0x59, 'dword ptr [0x498], 0x500'),
-                      (0x7E, 'dword ptr [eax + 0xac], ecx')):
+    for off, want in ((0x5C, 'edx, dword ptr [eax + 0xac]'),
+                      (0x72, 'dword ptr [0x300], 0x400'),
+                      (0x7C, 'dword ptr [0x498], 0x500'),
+                      (0xA1, 'dword ptr [eax + 0xac], ecx')):
         if ins[off].mnemonic != 'mov' or ins[off].op_str != want:
             return False
-    if ins[0xB6].mnemonic != 'ret' or ins[0xB6].op_str != '4':
+    if ins[0xF1].mnemonic != 'ret' or ins[0xF1].op_str != '4':
         return False
     # 处理器区独立反汇编：线性反汇编跨 0xFF 零填充会吞掉 0x100 边界
     hins = {i.address: i for i in md.disasm(code[0x100:0x193], 0x100)}
     if not hins[0x100].op_str.startswith('eax, dword ptr [esp + 0xc]'):
         return False
     if hins[0x178].mnemonic != 'mov' \
-            or hins[0x178].op_str != 'dword ptr [eax + 0xb8], 0x94':
+            or hins[0x178].op_str != 'dword ptr [eax + 0xb8], 0xc7':
         return False
     if hins[0x190].mnemonic != 'ret' or hins[0x190].op_str != '0x10':
+        return False
+    # 修正桩独立反汇编：cmp/jne/pushad/popad/4 字段写入/尾跳
+    sins = {i.address: i for i in md.disasm(code[0x560:0x591], 0x560)}
+    if sins[0x560].mnemonic != 'cmp' or sins[0x560].op_str != 'dword ptr [esp + 4], 0x100e':
+        return False
+    if sins[0x568].mnemonic != 'jne' or int(sins[0x568].op_str, 16) != 0x58A:
+        return False
+    if sins[0x56A].mnemonic not in ('pushad', 'pushal') \
+            or sins[0x589].mnemonic not in ('popad', 'popal'):
+        return False
+    for off, want in ((0x56B, 'eax, dword ptr [esp + 0x2c]'),
+                      (0x56F, 'word ptr [eax + 2], 0x64'),
+                      (0x575, 'dword ptr [eax + 0x25], 0x64'),
+                      (0x57C, 'dword ptr [eax + 0x29], 1'),
+                      (0x583, 'word ptr [eax + 0x51], 0x5b1')):
+        if sins[off].mnemonic != 'mov' or sins[off].op_str != want:
+            return False
+    if sins[0x58F].mnemonic != 'jmp' or sins[0x58F].op_str != 'eax':
         return False
     if code[0x500:0x503] != b"\x33\xC0\xC3":
         return False
@@ -2042,7 +2147,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1047（房间内一键结算）")
+            root.title("属性助手 · 单机版 v1048（房间内一键结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -3547,13 +3652,17 @@ def run_ui():
         def native_enter_settle_impl(self):
             """房间内一键结算同步实现：单条 shellcode 完成——按 [mgr] 装假战绩
             对象 → 0x587E40 结算（v1047 起不再调用 0x63EEA0：房间内实测其内部
-            运行时调用表未就绪必崩）。返回结果消息字符串（含线程返回码翻译）。"""
+            运行时调用表未就绪必崩）；v1048 起发送点拦截修正 4110 的 4 个差异
+            字段（服务器只验包内容）。返回结果消息字符串（含线程返回码翻译）。"""
             handle, base = self.handle, self.base
             for off, want in ((NATIVE_ENTER_INIT, NATIVE_ENTER_SIG),
                               (NATIVE_SETTLE_FN, NATIVE_SETTLE_SIG),
                               *NATIVE_GUARD_SIGS):
                 if read_mem(handle, base + off, len(want)) != want:
                     return "当前客户端不是新版（进局/结算函数序言不符），房间进局结算不可用。"
+            if read_mem(handle, base + NATIVE_SEND_CALL, len(NATIVE_SEND_CALL_SIG)) \
+                    != NATIVE_SEND_CALL_SIG:
+                return "当前客户端不是新版（4110 发送调用点字节不符），房间结算不可用。"
             if not read_u32(handle, base + NATIVE_GAME_MGR):
                 return "游戏管理器为空：客户端状态异常，无法进局。"
             pre = {n: read_u32(handle, base + r) for n, r in
@@ -3573,6 +3682,10 @@ def run_ui():
                 # RWX：SEH 处理器要把寄存器快照写回缓冲区尾部
                 ok = bool(k32.VirtualProtectEx(handle, ctypes.c_void_p(block), 4096,
                                                PAGE_EXECUTE_READWRITE, ctypes.byref(previous)))
+                # .text 调用点页改 RWX：线程要把 E8 临时改成 E9（修正桩跳板）
+                ok = ok and bool(k32.VirtualProtectEx(
+                    handle, ctypes.c_void_p(base + NATIVE_SEND_CALL), 8,
+                    PAGE_EXECUTE_READWRITE, ctypes.byref(previous)))
                 k32.FlushInstructionCache(handle, ctypes.c_void_p(block), len(blob))
             thread = 0
             if ok:
@@ -3620,7 +3733,7 @@ def run_ui():
                 write_diag_log(diag)
                 self.diag_msg = diag
                 return "房间结算异常已拦截，但未能读取寄存器快照。详情见弹窗。"
-            return {1: "结算完成：客户端已发出 4110。",
+            return {1: "结算完成：客户端已发出修正后的 4110。",
                     2: "结算中止：战斗管理器为空（不在房间/对局内）。",
                     }.get(exit_code.value, f"结算返回未知码 {exit_code.value}。")
 
