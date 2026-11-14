@@ -212,6 +212,9 @@ WINE REGISTRY Version 2
 #time=1dd73ef8bf53340
 "1"="00000409"
 
+[Software\\Classes] 1794635123
+#time=1dd73fb5795362a
+
 [Software\\Microsoft\\Internet Explorer\\Main] 1794630066
 #time=1dd73ef917769a0
 "Search Page"="https://www.google.com"
@@ -226,6 +229,12 @@ WINE REGISTRY Version 2
 
 [Software\\Microsoft\\Protected Storage System Provider] 1794630066
 #time=1dd73ef917f986e
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced] 1794635123
+#time=1dd73fb579406c4
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts] 1794635123
+#time=1dd73fb579407d2
 
 [Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders] 1794630064
 #time=1dd73ef904208c4
@@ -287,8 +296,13 @@ WINE REGISTRY Version 2
 "{A520A1A4-1780-4FF6-BD18-167343C5AF16}"=str(2):"%USERPROFILE%\\AppData\\LocalLow"
 "{BFB9D5E0-C6A9-404C-B2B2-AE6DB6AF4968}"=str(2):"%USERPROFILE%\\Links"
 
-[Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings] 1794630065
-#time=1dd73ef90e46dda
+[Software\\Microsoft\\Windows\\CurrentVersion\\ImmersiveShell] 1794635123
+#time=1dd73fb579409d0
+"TabletMode"=dword:00000000
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings] 1794635124
+#time=1dd73fb581dd750
+"ProxyEnable"=dword:00000000
 "User Agent"="Mozilla/4.0 (compatible; MSIE 8.0; Win32)"
 
 [Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\ZoneMap] 1794630065
@@ -623,13 +637,13 @@ WINE REGISTRY Version 2
 [Software\\Wine\\FileOpenAssociations] 1794630070
 #time=1dd73ef93ae6412
 
-[Software\\Wine\\Fonts] 1794630522
-#time=1dd73f0a16ea552
+[Software\\Wine\\Fonts] 1794635676
+#time=1dd73fca17c06c8
 "Codepages"="1252,437"
 "LogPixels"=dword:00000060
 
-[Software\\Wine\\Fonts\\External Fonts] 1794630057
-#time=1dd73ef8bf4f556
+[Software\\Wine\\Fonts\\External Fonts] 1794635112
+#time=1dd73fb50fbe93a
 "@Noto Sans CJK HK (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\noto-cjk-otf\\NotoSansCJKhk-Regular.otf"
 "@Noto Sans CJK HK Black (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\noto\\NotoSansCJK-Black.ttc"
 "@Noto Sans CJK HK Bold (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\noto-cjk-otf\\NotoSansCJKhk-Bold.otf"
@@ -769,7 +783,7 @@ WINE REGISTRY Version 2
 "Liberation Serif Bold (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\liberation\\LiberationSerif-Bold.ttf"
 "Liberation Serif Bold Italic (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\liberation\\LiberationSerif-BoldItalic.ttf"
 "Liberation Serif Italic (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\liberation\\LiberationSerif-Italic.ttf"
-"Marlett (TrueType)"="Z:\\usr\\share\\wine\\fonts\\marlett.ttf"
+"Marlett (TrueType)"="Z:\\workspace\\.wine-env\\wine\\share\\wine\\fonts\\marlett.ttf"
 "NimbusMonoPS-Bold (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\NimbusMonoPS-Bold.otf"
 "NimbusMonoPS-BoldItalic (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\NimbusMonoPS-BoldItalic.otf"
 "NimbusMonoPS-Italic (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\NimbusMonoPS-Italic.otf"
@@ -3279,9 +3293,9 @@ WINE REGISTRY Version 2
 "Roboto Thin Italic (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\roboto\\unhinted\\RobotoTTF\\Roboto-ThinItalic.ttf"
 "Smiley Sans Oblique (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\smiley-sans\\SmileySans-Oblique.otf"
 "Standard Symbols PS (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\StandardSymbolsPS.otf"
-"Symbol (TrueType)"="Z:\\usr\\share\\wine\\fonts\\symbol.ttf"
-"Tahoma (TrueType)"="Z:\\usr\\share\\wine\\fonts\\tahoma.ttf"
-"Tahoma Bold (TrueType)"="Z:\\usr\\share\\wine\\fonts\\tahomabd.ttf"
+"Symbol (TrueType)"="Z:\\workspace\\.wine-env\\wine\\share\\wine\\fonts\\symbol.ttf"
+"Tahoma (TrueType)"="Z:\\workspace\\.wine-env\\wine\\share\\wine\\fonts\\tahoma.ttf"
+"Tahoma Bold (TrueType)"="Z:\\workspace\\.wine-env\\wine\\share\\wine\\fonts\\tahomabd.ttf"
 "URWBookman-Demi (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\URWBookman-Demi.otf"
 "URWBookman-DemiItalic (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\URWBookman-DemiItalic.otf"
 "URWBookman-Light (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\URWBookman-Light.otf"
@@ -3290,28 +3304,28 @@ WINE REGISTRY Version 2
 "URWGothic-BookOblique (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\URWGothic-BookOblique.otf"
 "URWGothic-Demi (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\URWGothic-Demi.otf"
 "URWGothic-DemiOblique (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\URWGothic-DemiOblique.otf"
-"Webdings (TrueType)"="Z:\\usr\\share\\wine\\fonts\\webdings.ttf"
+"Webdings (TrueType)"="Z:\\workspace\\.wine-env\\wine\\share\\wine\\fonts\\webdings.ttf"
 "WenQuanYi Micro Hei (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\wqy\\wqy-microhei.ttc"
 "WenQuanYi Micro Hei Mono (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\wqy\\wqy-microhei.ttc"
 "WenQuanYi Zen Hei (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\wqy\\wqy-zenhei.ttc"
 "WenQuanYi Zen Hei Mono (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\wqy\\wqy-zenhei.ttc"
 "WenQuanYi Zen Hei Sharp (TrueType)"="Z:\\usr\\share\\fonts\\truetype\\wqy\\wqy-zenhei.ttc"
-"Wingdings (TrueType)"="Z:\\usr\\share\\wine\\fonts\\wingding.ttf"
+"Wingdings (TrueType)"="Z:\\workspace\\.wine-env\\wine\\share\\wine\\fonts\\wingding.ttf"
 "Z003-MediumItalic (TrueType)"="Z:\\usr\\share\\fonts\\opentype\\urw-base35\\Z003-MediumItalic.otf"
 
 [Software\\Wine\\MenuFiles] 1794630070
 #time=1dd73ef93b45eb2
 
-[Volatile Environment] 1794630068
-#time=1dd73ef928a9c0e
+[Volatile Environment] 1794635124
+#time=1dd73fb581223ce
 "APPDATA"="C:\\users\\root\\AppData\\Roaming"
 "CLIENTNAME"="Console"
 "HOMEDRIVE"="C:"
 "HOMEPATH"="\\users\\root"
 "HOMESHARE"=""
 "LOCALAPPDATA"="C:\\users\\root\\AppData\\Local"
-"LOGONSERVER"="\\\\ALL-IN-ONE-81-L"
+"LOGONSERVER"="\\\\ALL-IN-ONE-94-X"
 "SESSIONNAME"="Console"
-"USERDOMAIN"="ALL-IN-ONE-81-L"
+"USERDOMAIN"="ALL-IN-ONE-94-X"
 "USERNAME"="root"
 "USERPROFILE"="C:\\users\\root"
