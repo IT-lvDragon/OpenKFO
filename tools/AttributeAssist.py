@@ -14,6 +14,7 @@ import random
 import struct
 import sys
 import time
+from collections import Counter
 from ctypes import wintypes
 
 # ---- 偏移常量（main.cpp / kill.h，gfxz.dat 1B7C8676 实测）----
@@ -1738,7 +1739,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1034（结算优化）")
+            root.title("属性助手 · 单机版 v1035（对局号回退）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -3074,12 +3075,25 @@ def run_ui():
                                       i4110 + 1, old.hex().upper(), token.hex().upper()))
 
         def settle_token(self):
-            """最新一条游戏发的 8071(75B) 尾部 8 字节 = 本局进图 token。"""
+            """本局进图 token：优先取最新一条 8071(75B) 尾 8 字节；整局没有
+            75B 时回退为全部 8071 尾 8 字节中出现最多的非零值（新版的
+            94B/87B/103B 等长度同样携带 token，个别局可能一条 75B 都没有）。"""
             for rec in reversed(self.packets):
                 if not rec.get("mine") and rec["id"] == 8071 \
                         and len(rec["data"]) == 75:
                     return bytes(rec["data"][-8:])
-            return None
+            tails = Counter()
+            latest = {}
+            for i, rec in enumerate(self.packets):
+                if not rec.get("mine") and rec["id"] == 8071 \
+                        and len(rec["data"]) >= 8:
+                    t = bytes(rec["data"][-8:])
+                    if any(t):
+                        tails[t] += 1
+                        latest[t] = i
+            if not tails:
+                return None
+            return max(tails, key=lambda t: (tails[t], latest[t]))
 
         def settle_tmpl(self):
             """4110 模板：优先用已锁定的缓存；否则取列表里**第一条**游戏发的
@@ -3131,7 +3145,7 @@ def run_ui():
                 return
             token = self.settle_token()
             if token is None:
-                self.replay_status.set("直接结算：列表里没有 8071(75B)，先开抓包进图。")
+                self.replay_status.set("直接结算：列表里没有可用的 8071 对局号，先开抓包进图。")
                 return
             tmpl = self.settle_tmpl()
             if tmpl is None:
