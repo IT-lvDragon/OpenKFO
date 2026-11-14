@@ -54,6 +54,11 @@ KILL_SEND_OFF = 0x63FBB0              # 发包函数，序言 0x51EC8B55
 KILL_DAMAGE_OFF = 0x5F29F0            # thiscall 伤害调用，序言 0x83EC8B55
 KILL_HEALTH_OFF = 0x5E45B0            # 目标血量读取，序言 0x81EC8B55
 
+# ---- 原生结算：新版 gfld.dat 逆向（0x587E40 拼好 8×87B 的 4110 并经 0x63C950 发送）----
+NATIVE_SETTLE_FN = 0x587E40           # thiscall 结算函数：this=[0x17C8710]，参数 word=结算类型(抓包实测 1)
+NATIVE_SETTLE_MGR = 0x17C8710         # 战斗管理器全局指针（非空 = 在战斗中）
+NATIVE_SETTLE_SIG = b"\x55\x8B\xEC\x81\xEC\x64\x03\x00\x00"   # 0x587E40 序言（旧版客户端该 RVA 几乎必不相同）
+
 # ---- Win32 绑定 ----
 k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
 _handle = wintypes.HANDLE
@@ -922,6 +927,37 @@ class KillJob:
         return result if not self.timed_out else -3
 
 
+def native_settle_code(base):
+    """远程线程体：push 1; ecx=[战斗管理器]; call 原生 4110 结算函数; ret 4。
+
+    客户端用当前实时状态自行拼 8×87B 的合法 4110 并经 0x63C950 发出，
+    全程不修改任何游戏字节；管理器为空时直接返回。地址 = base + RVA。"""
+    fn = (base + NATIVE_SETTLE_FN) & 0xFFFFFFFF
+    mgr = (base + NATIVE_SETTLE_MGR) & 0xFFFFFFFF
+    return bytes(
+        [0x6A, 0x01]                                  # push 1（结算类型，与真实抓包一致）
+        + [0xA1] + list(struct.pack("<I", mgr))       # mov eax, [mgr]
+        + [0x85, 0xC0]                                # test eax, eax
+        + [0x74, 0x09]                                # je -> xor 段（跳过 9 字节到 +20）
+        + [0x8B, 0xC8]                                # mov ecx, eax（thiscall this）
+        + [0xB8] + list(struct.pack("<I", fn))        # mov eax, fn
+        + [0xFF, 0xD0]                                # call eax
+        + [0x33, 0xC0]                                # xor eax, eax
+        + [0xC2, 0x04, 0x00])                         # ret 4（平衡线程入口参数）
+
+
+def settle_code_self_test():
+    """native_settle_code 的字节级自检：结构 + je 跳转偏移。"""
+    code = native_settle_code(0x400000)
+    expect = bytes([0x6A, 0x01, 0xA1, 0x10, 0xC7, 0x5B, 0x01, 0x85, 0xC0, 0x74, 0x09,
+                    0x8B, 0xC8, 0xB8, 0x40, 0x7E, 0x98, 0x01, 0xFF, 0xD0, 0x33, 0xC0,
+                    0xC2, 0x04, 0x00])
+    if code != expect:
+        return False
+    assert code[11:13] == b"\x8b\xc8" and code[20:22] == b"\xff\xd0"
+    return True
+
+
 # ---- 结算重放：钩住发包函数抓包，改字节后经原生 send 原样重发 ----
 HOOK_CTR_OFF = 0        # 抓包数据块：发包计数器（游戏线程 lock xadd 递增）
 HOOK_MARKER_OFF = 4     # 抓包数据块：重放标记（重放线程置 1，钩子记录进槽）
@@ -1739,7 +1775,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1036（模板可选）")
+            root.title("属性助手 · 单机版 v1037（原生结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -2020,6 +2056,8 @@ def run_ui():
                 width=46)
             self.settle_tmpl_box.pack(side="left", padx=(6, 0))
             self.settle_tmpl_box.bind("<<ComboboxSelected>>", self.on_settle_tmpl_pick)
+            ttk.Button(trow, text="原生结算",
+                       command=self.native_settle).pack(side="left", padx=(8, 0))
             ttk.Checkbutton(srow, text="自动结算", variable=self.settle_auto_var
                             ).pack(side="left", padx=(10, 0))
             ttk.Checkbutton(srow, text="带确认包", variable=self.settle_extras_var
@@ -3163,6 +3201,47 @@ def run_ui():
             self.settle_tmpl_pick_refresh()
             self.replay_status.set("直接结算模板已重置：选回列表第一条 4110"
                                    "（也可在下拉框里换选其他 4110）。")
+
+        def native_settle(self):
+            """新版客户端原生结算：远程线程调用 0x587E40，客户端自行拼 4110 发送。"""
+            handle, base = self.handle, self.base
+            if not handle or not base:
+                self.replay_status.set("未连接游戏进程。")
+                return
+            sig = read_mem(handle, base + NATIVE_SETTLE_FN, len(NATIVE_SETTLE_SIG))
+            if sig != NATIVE_SETTLE_SIG:
+                self.replay_status.set("当前客户端不是新版（0x587E40 序言不符），"
+                                       "原生结算不可用；请用直接结算。")
+                return
+            if not read_u32(handle, base + NATIVE_SETTLE_MGR):
+                self.replay_status.set("战斗管理器为空：当前不在战斗中，无法结算。")
+                return
+            block = k32.VirtualAllocEx(handle, None, 4096, MEM_COMMIT_RESERVE,
+                                       PAGE_READWRITE) or 0
+            if not block:
+                self.replay_status.set(f"远程内存分配失败（{ctypes.get_last_error()}）。")
+                return
+            code = native_settle_code(base)
+            got = ctypes.c_size_t(0)
+            ok = bool(k32.WriteProcessMemory(handle, ctypes.c_void_p(block), code,
+                                             len(code), ctypes.byref(got))) \
+                and got.value == len(code)
+            if ok:
+                previous = wintypes.DWORD(0)
+                ok = bool(k32.VirtualProtectEx(handle, ctypes.c_void_p(block), 4096,
+                                               PAGE_EXECUTE_READ, ctypes.byref(previous)))
+                k32.FlushInstructionCache(handle, ctypes.c_void_p(block), len(code))
+            thread = 0
+            if ok:
+                thread = k32.CreateRemoteThread(handle, None, 0, ctypes.c_void_p(block),
+                                                None, 0, None) or 0
+            if thread:
+                k32.WaitForSingleObject(thread, 3000)
+                k32.CloseHandle(thread)
+                self.replay_status.set("已调用原生结算：客户端已自行构造 4110 发送。")
+            else:
+                self.replay_status.set(f"远程线程创建失败（{ctypes.get_last_error()}）。")
+            k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
 
         def settle_send_with(self, tmpl, token):
             """按模板参数发送换好 token 的 4110，成功返回 True。"""
