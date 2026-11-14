@@ -2176,7 +2176,7 @@ def run_ui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("属性助手 · 单机版 v1050（房间内一键结算）")
+            root.title("属性助手 · 单机版 v1051（房间内一键结算）")
             root.resizable(False, False)
             self.handle = 0
             self.base = 0
@@ -3682,9 +3682,10 @@ def run_ui():
             """房间内一键结算同步实现：单条 shellcode 完成——按 [mgr] 装假战绩
             对象 → 0x587E40 结算（v1047 起不再调用 0x63EEA0：房间内实测其内部
             运行时调用表未就绪必崩）；v1048 起发送点拦截修正 4110 的 4 个差异
-            字段（服务器只验包内容）；v1050 起桩命中后快照记录 0（+0x238 命中
-            标志/+0x23C 包体指针/+0x240 快照），供工具读取弹窗自证。
-            返回结果消息字符串（含线程返回码翻译）。"""
+            字段（服务器只验包内容）；v1050 桩内含自证快照（+0x238 命中标志/
+            +0x23C 包体指针/+0x240 记录 0），实测确认字段修正生效但服务器仍不
+            发奖励，问题暂搁置（不再弹窗读取，快照保留备用），见
+            docs/ROOM_SETTLE_4110_20261114.md。返回结果消息字符串。"""
             handle, base = self.handle, self.base
             for off, want in ((NATIVE_ENTER_INIT, NATIVE_ENTER_SIG),
                               (NATIVE_SETTLE_FN, NATIVE_SETTLE_SIG),
@@ -3734,11 +3735,6 @@ def run_ui():
                 raw = read_mem(handle, block + 0x200, 0x30)   # SEH 快照：释放前读出
                 if raw and len(raw) == 0x30:
                     dump = struct.unpack("<12I", raw)
-            pkt = None
-            if exit_code.value == 1:
-                raw = read_mem(handle, block + 0x238, 0x5F)   # 桩自证：命中标志+包体指针+记录0快照
-                if raw and len(raw) == 0x5F:
-                    pkt = raw
             k32.VirtualFreeEx(handle, ctypes.c_void_p(block), 0, MEM_RELEASE)
             if wait == WAIT_TIMEOUT or exit_code.value == 259:   # 259 = STILL_ACTIVE
                 return ("结算未在时限内完成（远程线程未退出）：请稍等几秒再点一次"
@@ -3769,21 +3765,8 @@ def run_ui():
                 write_diag_log(diag)
                 self.diag_msg = diag
                 return "房间结算异常已拦截，但未能读取寄存器快照。详情见弹窗。"
-            if exit_code.value == 1 and pkt is not None:
-                hit, bufptr = struct.unpack_from("<2I", pkt, 0)
-                hexs = " ".join(f"{b:02X}" for b in pkt[8:])
-                if hit == 1:
-                    diag = ("4110 发送桩自证：已命中并完成 4 字段修正。\n"
-                            f"包体=0x{bufptr:08X}\n记录0（修正后，0x57 字节）：\n{hexs}")
-                    logpath = write_diag_log(diag.replace("\n", " "))
-                    self.diag_msg = diag + ("\n\n（本框文字可直接 Ctrl+C 复制全文；"
-                                            + (f"日志：{logpath}" if logpath else "日志写入失败") + "）")
-                    return ("结算完成：4110 已发出并完成字段修正。发包快照已弹窗，"
-                            "若无奖励请把弹窗全文发给开发者。")
-                diag = "4110 发送桩未命中（包 id != 0x100E，未经修正原样发出）。"
-                write_diag_log(diag)
-                self.diag_msg = diag
-                return "结算完成但桩未命中：4110 未经修正原样发出。详情见弹窗。"
+            # 已知问题（暂搁置，详见 docs/ROOM_SETTLE_4110_20261114.md）：
+            # 房间内 4110 已发出且桩确认完成 4 字段修正，但服务器仍不发奖励。
             return {1: "结算完成：客户端已发出修正后的 4110。",
                     2: "结算中止：战斗管理器为空（不在房间/对局内）。",
                     }.get(exit_code.value, f"结算返回未知码 {exit_code.value}。")
